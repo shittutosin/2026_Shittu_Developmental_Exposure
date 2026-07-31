@@ -1,10 +1,13 @@
 # ============================================================
 # KO-LEVEL STACKED BAR PLOTS FROM expr_imp FILES
 # STACK BY TAXA
+# BAR HEIGHT NORMALIZED TO THE MAXIMUM MEAN ABUNDANCE WITHIN EACH KO x SEX
 #
 # BARS:
-#   Log10 mean summed KO protein abundance by group
-#   (stacked by taxa contribution)
+#   Mean summed KO protein abundance by group, normalized to the
+#   maximum mean abundance observed for that KO within the same sex
+#   across all Timepoint x Group combinations (maximum = 1).
+#   Taxa segments retain their proportional contribution.
 #
 # STATS:
 #   PATHWAY-STYLE KO-LEVEL WILCOXON
@@ -36,34 +39,34 @@ suppressPackageStartupMessages({
 # 0. SETTINGS
 # ============================================================
 
-setwd("data/proteomics/KO_analysis_for_proteins")
+setwd("/data/proteomics/KO-level_analysis")
 
-out_dir <- "KO_level_analysis"
+out_dir <- "KO_selected_abundance_stacked_by_taxa_normalized"
 dir.create(out_dir, showWarnings = FALSE)
 dir.create(file.path(out_dir, "tables"), showWarnings = FALSE)
 dir.create(file.path(out_dir, "plots"), showWarnings = FALSE)
 
 # ---- Relative abundance stacked taxa plot folders ----
 dir.create(
-  file.path(out_dir, "plots", "relative_abundance_stacked_taxa"),
+  file.path(out_dir, "plots", "normalized_max_stacked_taxa"),
   recursive = TRUE,
   showWarnings = FALSE
 )
 
 dir.create(
-  file.path(out_dir, "plots", "relative_abundance_stacked_taxa", "tiff"),
+  file.path(out_dir, "plots", "normalized_max_stacked_taxa", "tiff"),
   recursive = TRUE,
   showWarnings = FALSE
 )
 
 dir.create(
-  file.path(out_dir, "plots", "relative_abundance_stacked_taxa", "png"),
+  file.path(out_dir, "plots", "normalized_max_stacked_taxa", "png"),
   recursive = TRUE,
   showWarnings = FALSE
 )
 
 dir.create(
-  file.path(out_dir, "plots", "relative_abundance_stacked_taxa", "pdf"),
+  file.path(out_dir, "plots", "normalized_max_stacked_taxa", "pdf"),
   recursive = TRUE,
   showWarnings = FALSE
 )
@@ -433,8 +436,19 @@ ko_org_sample_collapsed <- ko_org_sample %>%
 # ============================================================
 # ============================================================
 # 10. SUMMARY FOR STACKED BARS
-# Bar total height = log10(total KO abundance)
-# Taxa colors show proportional contribution
+#
+# The total height of each bar is normalized to the largest mean
+# KO abundance observed for that KO within the same sex across
+# all Timepoint x Group combinations. Therefore, the largest
+# bar for each KO within each sex equals 1.
+#
+# Taxa segments retain their proportional contribution to total
+# KO abundance within each bar. This normalization is used only
+# for visualization and does not affect the statistical analysis.
+#
+# Because males and females are normalized independently, scaled
+# bar heights should not be used to compare absolute KO abundance
+# between sexes.
 # ============================================================
 
 ko_org_group_summary <- ko_org_sample_collapsed %>%
@@ -448,9 +462,22 @@ ko_org_group_summary <- ko_org_sample_collapsed %>%
   group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
   mutate(
     total_mean_linear = sum(mean_linear, na.rm = TRUE),
-    taxa_fraction = ifelse(total_mean_linear > 0, mean_linear / total_mean_linear, 0),
-    total_log10_abundance = log10(total_mean_linear + 1),
-    plot_height = taxa_fraction * total_log10_abundance
+    taxa_fraction = ifelse(
+      total_mean_linear > 0,
+      mean_linear / total_mean_linear,
+      0
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(KO, name, Pathway, Sex) %>%
+  mutate(
+    sex_specific_ko_max_mean_linear = max(total_mean_linear, na.rm = TRUE),
+    normalized_total_abundance = ifelse(
+      is.finite(sex_specific_ko_max_mean_linear) & sex_specific_ko_max_mean_linear > 0,
+      total_mean_linear / sex_specific_ko_max_mean_linear,
+      0
+    ),
+    plot_height = taxa_fraction * normalized_total_abundance
   ) %>%
   ungroup()
 # ============================================================
@@ -483,9 +510,10 @@ ko_taxa_contributor_rank <- ko_org_group_summary %>%
     mean_linear,
     median_linear,
     total_mean_linear,
+    sex_specific_ko_max_mean_linear,
+    normalized_total_abundance,
     taxa_fraction,
     percent_contribution,
-    total_log10_abundance,
     plot_height,
     n_samples
   )
@@ -508,6 +536,8 @@ analysis_parameters <- tibble(
     "Abundance scale",
     "Linear abundance calculation",
     "Stacked bar y-axis",
+    "Normalization scope",
+    "Cross-sex interpretation",
     "Taxa collapse rule",
     "Statistical test",
     "Comparison",
@@ -521,7 +551,9 @@ analysis_parameters <- tibble(
     protein_ko_map_file,
     "Protein-level log2 intensity from expr_imp files",
     "linear_abundance = 2^log2_intensity",
-    "log10(total mean KO linear abundance + 1)",
+    "Scaled mean KO abundance (maximum within KO x Sex = 1)",
+    "Maximum calculated separately for each KO x Sex across all Timepoint x Group combinations; visualization only",
+    "Scaled bar heights must not be used to compare absolute KO abundance between males and females",
     paste0("Top ", top_n_taxa, " taxa per KO x Sex retained; remaining taxa collapsed as Other"),
     "Wilcoxon rank-sum test",
     "Control vs Dosed within each KO x Sex x Timepoint",
@@ -543,7 +575,7 @@ write_csv(
 
 write_csv(
   ko_org_group_summary,
-  file.path(out_dir, "tables", "selected_KO_taxa_group_mean_log10_abundance.csv")
+  file.path(out_dir, "tables", "selected_KO_taxa_group_mean_normalized_abundance.csv")
 )
 
 write_csv(
@@ -579,7 +611,7 @@ write_xlsx(
     KO_contributing_proteins = ko_protein_table,
     KO_total_linear_per_sample = ko_sample_total,
     KO_taxa_linear_per_sample = ko_org_sample_collapsed,
-    KO_taxa_group_mean_log10 = ko_org_group_summary,
+    KO_taxa_group_mean_normalized = ko_org_group_summary,
     KO_taxa_contributor_rank = ko_taxa_contributor_rank,
     KO_panel_stats = panel_stats,
     KO_coverage_summary = ko_coverage
@@ -676,8 +708,8 @@ plot_one_ko_sex <- function(target_ko, target_sex,
   
   detected_timepoints <- one %>%
     filter(
-      !is.na(total_log10_abundance),
-      total_log10_abundance > 0
+      !is.na(normalized_total_abundance),
+      normalized_total_abundance > 0
     ) %>%
     distinct(Timepoint) %>%
     pull(Timepoint) %>%
@@ -710,13 +742,13 @@ plot_one_ko_sex <- function(target_ko, target_sex,
   if (nrow(one) > 0) {
     
     panel_max <- one %>%
-      distinct(Timepoint, Group, total_log10_abundance) %>%
+      distinct(Timepoint, Group, normalized_total_abundance) %>%
       group_by(Timepoint) %>%
       summarise(
         ymax = ifelse(
-          all(is.na(total_log10_abundance)),
+          all(is.na(normalized_total_abundance)),
           0,
-          max(total_log10_abundance, na.rm = TRUE)
+          max(normalized_total_abundance, na.rm = TRUE)
         ),
         .groups = "drop"
       ) %>%
@@ -752,9 +784,9 @@ plot_one_ko_sex <- function(target_ko, target_sex,
       !is.na(p_value)
     ) %>%
     mutate(
-      bracket_y = ymax + 0.35,
-      bracket_y_low = ymax + 0.20,
-      label_y = ymax + 0.48,
+      bracket_y = ymax + 0.07,
+      bracket_y_low = ymax + 0.035,
+      label_y = ymax + 0.11,
       x_start = 1,
       x_end = 2,
       label_x = 1.5,
@@ -765,7 +797,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
   # Set a suitable common y-axis
   # ----------------------------------------------------------
   
-  abundance_values <- one$total_log10_abundance
+  abundance_values <- one$normalized_total_abundance
   abundance_values <- abundance_values[
     is.finite(abundance_values)
   ]
@@ -778,7 +810,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
   y_top <- max(
     c(abundance_values, stat_values, 1),
     na.rm = TRUE
-  ) + 0.35
+  ) + 0.15
   
   # ----------------------------------------------------------
   # Construct plot
@@ -879,14 +911,16 @@ plot_one_ko_sex <- function(target_ko, target_sex,
     
     scale_y_continuous(
       limits = c(0, y_top),
-      expand = expansion(mult = c(0.02, 0.05))
+      breaks = seq(0, 1, by = 0.25),
+      labels = scales::number_format(accuracy = 0.01),
+      expand = expansion(mult = c(0.02, 0.04))
     ) +
     
     labs(
       title = plot_title,
       subtitle = plot_subtitle,
       x = NULL,
-      y = "Log10 mean KO protein abundance",
+      y = "Scaled mean KO abundance",
       fill = "Taxa"
     ) +
     
@@ -943,7 +977,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
     clean_filename(ko_name),
     clean_filename(target_ko),
     clean_filename(target_sex),
-    "stacked_taxa_log10_abundance",
+    "stacked_taxa_normalized_max",
     sep = "_"
   )
   
@@ -1006,11 +1040,19 @@ for (i in seq_len(nrow(plot_keys))) {
     target_sex = this_sex,
     df_plot = ko_org_group_summary,
     df_stats = panel_stats,
-    out_dir_tiff = file.path(out_dir, "plots", "relative_abundance_stacked_taxa", "tiff"),
-    out_dir_png  = file.path(out_dir, "plots", "relative_abundance_stacked_taxa", "png"),
-    out_dir_pdf  = file.path(out_dir, "plots", "relative_abundance_stacked_taxa", "pdf")
+    out_dir_tiff = file.path(out_dir, "plots", "normalized_max_stacked_taxa", "tiff"),
+    out_dir_png  = file.path(out_dir, "plots", "normalized_max_stacked_taxa", "png"),
+    out_dir_pdf  = file.path(out_dir, "plots", "normalized_max_stacked_taxa", "pdf")
   )
 }
 
+write_csv(
+  expr_ko,
+  file.path(
+    out_dir,
+    "tables",
+    "selected_KO_protein_level_values_used_for_statistics.csv"
+  )
+)
 message("Done.")
 
