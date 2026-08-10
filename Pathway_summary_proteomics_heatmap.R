@@ -1,6 +1,6 @@
 # ============================================================
 # PATHWAY-SUMMARY HEATMAPS
-# expr_imp files + KOfamScan + eggNOG + KEGG REST
+# expr_imp files + hierarchical KO assignment + KEGG REST
 #
 # FINAL VERSION:
 #   - rows = KEGG pathway summaries
@@ -31,14 +31,14 @@ suppressPackageStartupMessages({
 # ============================================================
 setwd("data/proteomics/pathway_analysis")
 
-#Load expr_imp files obtained from the Global_Proteomics_ABPP_limma_analysis_code
+#Load expr_imp files obrained from the Global_Proteomics_ABPP_limma_analysis_code
 files <- list(
-  "5W_M"  = "expr_imp_5wks_M.xlsx",
-  "8W_M"  = "expr_imp_8wks_M.xlsx",
-  "12W_M" = "expr_imp_12wks_M.xlsx",
-  "5W_F"  = "expr_imp_5wks_F.xlsx",
-  "8W_F"  = "expr_imp_8wks_F.xlsx",
-  "12W_F" = "expr_imp_12wks_F.xlsx"
+  "5W_M"  = "expr_imp_5wks_M_8_2_3_0.05.xlsx",
+  "8W_M"  = "expr_imp_8wks_M_8_2_3_0.05.xlsx",
+  "12W_M" = "expr_imp_12wks_M_8_2_3_0.05.xlsx",
+  "5W_F"  = "expr_imp_5wks_F_8_2_3_0.05.xlsx",
+  "8W_F"  = "expr_imp_8wks_F_8_2_3_0.05.xlsx",
+  "12W_F" = "expr_imp_12wks_F_8_2_3_0.05.xlsx"
 )
 
 # -----------------------------
@@ -85,15 +85,15 @@ dir.create("Pathway_intermediate_tables", showWarnings = FALSE)
 # -----------------------------
 # Plot export settings
 # -----------------------------
-pdf_width  <- 14
-pdf_height <- 18
+pdf_width  <- 18
+pdf_height <- 16
 
 png_width_px  <- 4200
 png_height_px <- 5400
 png_res <- 300
 
-tiff_width_in  <- 14
-tiff_height_in <- 18
+tiff_width_in  <- 17
+tiff_height_in <- 15
 tiff_res <- 300
 # ============================================================
 # 1. HELPER FUNCTIONS
@@ -199,13 +199,13 @@ select_top_separating_pathways <- function(mat_raw, group_vector, n_keep = NULL)
 # 2. LOAD eggNOG -> ALL PROTEIN-KO MEMBERSHIPS
 # ============================================================
 
-raw_lines <- readLines("eggnog.emapper.annotations")
+raw_lines <- readLines("merged.emapper.annotations")
 
 header_line <- sub("^#", "", raw_lines[grepl("^#query", raw_lines)])
 header <- strsplit(header_line, "\t")[[1]]
 
 eggnog <- read.delim(
-  "eggnog.emapper.annotations",
+  "merged.emapper.annotations",
   sep = "\t",
   header = FALSE,
   comment.char = "#",
@@ -258,7 +258,7 @@ eggnog_all_kos <- eggnog %>%
 # ============================================================
 
 kofam_raw <- read.table(
-  "kofam_annotation_output.txt",
+  "large_kofam_output.txt",
   header = FALSE,
   comment.char = "#",
   stringsAsFactors = FALSE,
@@ -313,7 +313,7 @@ kofam_strict_all <- kofam %>%
     Protein = gene,
     KO = KO,
     Function_from_annotation = definition,
-    Source = "KOfam",
+    Source = "KOfam_strict",
     eggnog_evalue = NA_real_,
     kofamscan_evalue = evalue,
     kofamscan_score = score
@@ -358,10 +358,30 @@ kofam_relaxed_all <- kofam_relaxed_input %>%
   ) %>%
   distinct()
 
-protein_ko_membership <- bind_rows(
+# ============================================================
+# 3B. HIERARCHICAL PROTEIN -> KO ASSIGNMENT
+#
+# PRIORITY:
+#   1. KOfam strict
+#   2. KOfam relaxed, ONLY if no strict KOfam KO exists
+#   3. eggNOG, ONLY if neither strict nor relaxed KOfam KO exists
+#
+# IMPORTANT:
+# The hierarchy is applied at the PROTEIN level.
+# Once a protein is assigned by a higher-priority source,
+# lower-priority sources are not used for that protein.
+#
+# If the winning source itself reports >1 distinct KO for a
+# protein, those KOs are retained and flagged in a QC table
+# rather than arbitrarily choosing one.
+# ============================================================
+
+# Keep a raw pooled table for auditing only.
+# This table is NOT used for pathway or KO quantification.
+protein_ko_all_sources_raw <- bind_rows(
   kofam_strict_all,
-  eggnog_all_kos,
-  kofam_relaxed_all
+  kofam_relaxed_all,
+  eggnog_all_kos
 ) %>%
   mutate(
     Function_from_annotation = ifelse(
@@ -373,16 +393,159 @@ protein_ko_membership <- bind_rows(
   distinct(Protein, KO, Source, .keep_all = TRUE)
 
 write_csv(
-  protein_ko_membership,
-  file.path("Pathway_intermediate_tables", "Protein_KO_membership_all_sources.csv")
+  protein_ko_all_sources_raw,
+  file.path(
+    "Pathway_intermediate_tables",
+    "Protein_KO_membership_RAW_all_sources.csv"
+  )
 )
 
+# -----------------------------
+# Layer 1: KOfam strict
+# -----------------------------
+kofam_strict_selected <- kofam_strict_all %>%
+  mutate(
+    Function_from_annotation = ifelse(
+      is.na(Function_from_annotation) | Function_from_annotation == "",
+      KO,
+      Function_from_annotation
+    )
+  ) %>%
+  distinct(Protein, KO, Source, .keep_all = TRUE)
+
+strict_assigned_proteins <- kofam_strict_selected %>%
+  distinct(Protein)
+
+# -----------------------------
+# Layer 2: KOfam relaxed
+# ONLY proteins with no strict KOfam assignment
+# -----------------------------
+kofam_relaxed_selected <- kofam_relaxed_all %>%
+  anti_join(strict_assigned_proteins, by = "Protein") %>%
+  mutate(
+    Function_from_annotation = ifelse(
+      is.na(Function_from_annotation) | Function_from_annotation == "",
+      KO,
+      Function_from_annotation
+    )
+  ) %>%
+  distinct(Protein, KO, Source, .keep_all = TRUE)
+
+kofam_assigned_proteins <- bind_rows(
+  kofam_strict_selected %>% select(Protein),
+  kofam_relaxed_selected %>% select(Protein)
+) %>%
+  distinct(Protein)
+
+# -----------------------------
+# Layer 3: eggNOG
+# ONLY proteins with no strict or relaxed KOfam assignment
+# -----------------------------
+eggnog_selected <- eggnog_all_kos %>%
+  anti_join(kofam_assigned_proteins, by = "Protein") %>%
+  mutate(
+    Function_from_annotation = ifelse(
+      is.na(Function_from_annotation) | Function_from_annotation == "",
+      KO,
+      Function_from_annotation
+    )
+  ) %>%
+  distinct(Protein, KO, Source, .keep_all = TRUE)
+
+# -----------------------------
+# Final hierarchical mapping
+# -----------------------------
+protein_ko_membership <- bind_rows(
+  kofam_strict_selected,
+  kofam_relaxed_selected,
+  eggnog_selected
+) %>%
+  distinct(Protein, KO, Source, .keep_all = TRUE)
+
+# Main explicitly named hierarchical file
+write_csv(
+  protein_ko_membership,
+  file.path(
+    "Pathway_intermediate_tables",
+    "Protein_KO_membership_hierarchical.csv"
+  )
+)
+
+# Compatibility file:
+# keep the old filename so existing downstream scripts that read
+# Protein_KO_membership_all_sources.csv automatically use the
+# corrected hierarchical mapping after this script is rerun.
+write_csv(
+  protein_ko_membership,
+  file.path(
+    "Pathway_intermediate_tables",
+    "Protein_KO_membership_all_sources.csv"
+  )
+)
+
+# Unique Protein x KO mapping used for KEGG pathway mapping
 protein_ko_unique <- protein_ko_membership %>%
   distinct(Protein, KO, .keep_all = TRUE)
 
 write_csv(
   protein_ko_unique,
-  file.path("Pathway_intermediate_tables", "Protein_KO_unique_for_pathway_mapping.csv")
+  file.path(
+    "Pathway_intermediate_tables",
+    "Protein_KO_unique_for_pathway_mapping.csv"
+  )
+)
+
+# ============================================================
+# 3C. HIERARCHY QC
+# ============================================================
+
+# Number of proteins assigned by each winning layer
+ko_assignment_source_summary <- protein_ko_membership %>%
+  distinct(Protein, Source) %>%
+  count(Source, name = "n_proteins") %>%
+  arrange(match(Source, c("KOfam_strict", "KOfam_relaxed", "eggNOG")))
+
+write_csv(
+  ko_assignment_source_summary,
+  file.path(
+    "Pathway_intermediate_tables",
+    "Protein_KO_hierarchical_source_summary.csv"
+  )
+)
+
+# Check whether a protein still has >1 KO within its WINNING source.
+# This can legitimately occur within an annotation source, especially
+# eggNOG. These are retained but explicitly flagged for review.
+protein_multi_ko_qc <- protein_ko_membership %>%
+  group_by(Protein, Source) %>%
+  summarise(
+    n_KOs = n_distinct(KO),
+    KO_list = paste(sort(unique(KO)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_KOs > 1) %>%
+  arrange(desc(n_KOs), Source, Protein)
+
+write_csv(
+  protein_multi_ko_qc,
+  file.path(
+    "Pathway_intermediate_tables",
+    "QC_hierarchical_proteins_with_multiple_KOs.csv"
+  )
+)
+
+message(
+  "Hierarchical KO assignment complete: KOfam strict -> KOfam relaxed -> eggNOG"
+)
+
+message(
+  "Proteins assigned by source:"
+)
+print(ko_assignment_source_summary)
+
+message(
+  "Proteins with >1 KO within their winning source: ",
+  n_distinct(protein_multi_ko_qc$Protein)
 )
 
 # ============================================================
@@ -1131,6 +1294,7 @@ wb <- createWorkbook()
 # -----------------------------
 analysis_settings <- tibble(
   Setting = c(
+    "KO annotation hierarchy",
     "Z-score method",
     "Relaxed KOfam e-value cutoff",
     "Relaxed KOfam score fraction",
@@ -1141,6 +1305,7 @@ analysis_settings <- tibble(
     "KEGG cache used"
   ),
   Value = c(
+    "KOfam strict -> KOfam relaxed -> eggNOG fallback",
     ifelse(use_global_zscore, "Global row z-score across all datasets", "Row z-score within each dataset"),
     relaxed_evalue_cutoff,
     relaxed_score_fraction,
@@ -1159,8 +1324,11 @@ writeData(wb, "SI_Settings", analysis_settings)
 # Main supplementary tables
 # -----------------------------
 si_tables <- list(
-  "Protein_KO_all_sources" = protein_ko_membership,
+  "Protein_KO_raw_all_sources" = protein_ko_all_sources_raw,
+  "Protein_KO_hierarchical" = protein_ko_membership,
   "Protein_KO_unique" = protein_ko_unique,
+  "KO_source_summary" = ko_assignment_source_summary,
+  "KO_multi_assignment_QC" = protein_multi_ko_qc,
   "Observed_KO_to_pathway" = ko_to_pathway_obs,
   "Observed_pathway_metadata" = pathway_meta_obs,
   "Protein_KO_pathway" = protein_ko_pathway,
