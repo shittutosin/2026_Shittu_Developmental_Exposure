@@ -1,13 +1,13 @@
 # ============================================================
 # KO-LEVEL STACKED BAR PLOTS FROM expr_imp FILES
 # STACK BY TAXA
-# BAR HEIGHT NORMALIZED TO THE MAXIMUM MEAN ABUNDANCE WITHIN EACH KO x SEX
+# SAMPLE-LEVEL NORMALIZATION TO TOTAL MEASURED PROTEOME
 #
 # BARS:
-#   Mean summed KO protein abundance by group, normalized to the
-#   maximum mean abundance observed for that KO within the same sex
-#   across all Timepoint x Group combinations (maximum = 1).
-#   Taxa segments retain their proportional contribution.
+#   For each biological sample, summed linear KO abundance is divided by
+#   the summed linear abundance of ALL measured proteins in that same sample.
+#   Control/Dosed bars are then the mean sample-level relative KO abundance.
+#   Taxa segments retain their proportional contribution to the KO bar.
 #
 # STATS:
 #   PATHWAY-STYLE KO-LEVEL WILCOXON
@@ -39,42 +39,42 @@ suppressPackageStartupMessages({
 # 0. SETTINGS
 # ============================================================
 
-setwd("/data/proteomics/KO-level_analysis")
+setwd("/data/proteomics/KO_level_analysis")
 
-out_dir <- "KO_selected_abundance_stacked_by_taxa_normalized"
+out_dir <- "KO_selected_abundance_stacked_by_taxa_relative_proteome"
 dir.create(out_dir, showWarnings = FALSE)
 dir.create(file.path(out_dir, "tables"), showWarnings = FALSE)
 dir.create(file.path(out_dir, "plots"), showWarnings = FALSE)
 
 # ---- Relative abundance stacked taxa plot folders ----
 dir.create(
-  file.path(out_dir, "plots", "normalized_max_stacked_taxa"),
+  file.path(out_dir, "plots", "relative_proteome_stacked_taxa"),
   recursive = TRUE,
   showWarnings = FALSE
 )
 
 dir.create(
-  file.path(out_dir, "plots", "normalized_max_stacked_taxa", "tiff"),
+  file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "tiff"),
   recursive = TRUE,
   showWarnings = FALSE
 )
 
 dir.create(
-  file.path(out_dir, "plots", "normalized_max_stacked_taxa", "png"),
+  file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "png"),
   recursive = TRUE,
   showWarnings = FALSE
 )
 
 dir.create(
-  file.path(out_dir, "plots", "normalized_max_stacked_taxa", "pdf"),
+  file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "pdf"),
   recursive = TRUE,
   showWarnings = FALSE
 )
-plot_width  <- 13
-plot_height <- 7.5
+plot_width  <- 9
+plot_height <- 6
 plot_dpi    <- 600
 
-top_n_taxa <- 20
+top_n_taxa <- 12
 
 # ============================================================
 # 1. FILES
@@ -215,7 +215,7 @@ compute_ko_stats <- function(df_long) {
       n_control <- sum(dat$Group == "Control")
       n_dosed   <- sum(dat$Group == "Dosed")
       
-      if (n_control < 2 || n_dosed < 2) {
+      if (n_control < 1 || n_dosed < 1) {
         return(tibble(
           n_control = n_control,
           n_dosed = n_dosed,
@@ -298,6 +298,7 @@ read_one_limma_file <- function(f) {
       Protein = as.character(Protein),
       Function = as.character(Function),
       Organism = extract_organism(Function),
+      Organism = str_replace(Organism, "\\s+DSM\\s+\\d+$", ""),
       Organism = ifelse(is.na(Organism) | Organism == "", "Unknown organism", Organism)
     ) %>%
     distinct(Protein, Timepoint, Sex, Organism, .keep_all = TRUE)
@@ -358,8 +359,50 @@ read_one_expr_file <- function(f) {
 expr_long <- map_dfr(expr_files, read_one_expr_file)
 
 # ============================================================
-# 7. JOIN EXPRESSION TO KO MAP + ORGANISM
+# 7. CALCULATE TOTAL MEASURED PROTEOME PER SAMPLE
+#    BEFORE RESTRICTING TO SELECTED KOs
 # ============================================================
+
+# IMPORTANT:
+# The denominator is calculated from expr_long, which contains ALL proteins
+# in each expr_imp file. Therefore, total_proteome_linear is NOT restricted
+# to proteins present in KO_map_file.xlsx or protein_ko_map_file.
+#
+# For each biological sample:
+#   total_proteome_linear = sum(2^log2_intensity) across ALL measured proteins
+
+sample_total_proteome <- expr_long %>%
+  mutate(
+    linear_abundance = 2^log2_intensity
+  ) %>%
+  group_by(
+    Sex, Timepoint, Sample, Sample_ID, Group
+  ) %>%
+  summarise(
+    total_proteome_linear = sum(linear_abundance, na.rm = TRUE),
+    n_proteins_total = n_distinct(Protein[!is.na(log2_intensity)]),
+    .groups = "drop"
+  )
+
+# Safety check: each sample should have a finite, positive proteome denominator.
+bad_denominators <- sample_total_proteome %>%
+  filter(!is.finite(total_proteome_linear) | total_proteome_linear <= 0)
+
+if (nrow(bad_denominators) > 0) {
+  warning(
+    nrow(bad_denominators),
+    " sample(s) have non-finite or non-positive total proteome abundance. " ,
+    "Their relative KO abundance will be set to NA."
+  )
+}
+
+
+# ============================================================
+# 8. JOIN EXPRESSION TO KO MAP + ORGANISM
+# ============================================================
+
+# Only now do we restrict the numerator to proteins assigned to selected KOs.
+# The total-proteome denominator was already calculated using ALL proteins.
 
 expr_ko <- expr_long %>%
   inner_join(protein_ko_map, by = "Protein") %>%
@@ -371,41 +414,74 @@ expr_ko <- expr_long %>%
   ) %>%
   mutate(
     Organism = coalesce(Organism, Organism_global, "Unknown organism"),
-    Organism = ifelse(is.na(Organism) | Organism == "", "Unknown organism", Organism),
+    Organism = ifelse(
+      is.na(Organism) | Organism == "",
+      "Unknown organism",
+      Organism
+    ),
     linear_abundance = 2^log2_intensity
+  ) %>%
+  left_join(
+    sample_total_proteome,
+    by = c("Sex", "Timepoint", "Sample", "Sample_ID", "Group")
   ) %>%
   select(
     Protein, KO, name, Pathway, Timepoint, Sex, Sample, Sample_ID, Group,
-    Organism, log2_intensity, linear_abundance
+    Organism, log2_intensity, linear_abundance,
+    total_proteome_linear, n_proteins_total
   )
 
 if (nrow(expr_ko) == 0) {
   stop("After joining expression data to protein-KO mapping, no rows remained.")
 }
 
+
 # ============================================================
-# 8. SUM WITHIN SAMPLE: KO x SAMPLE x ORGANISM
+# 9. SUM WITHIN EACH SAMPLE: KO x SAMPLE x ORGANISM
 # ============================================================
 
 ko_org_sample <- expr_ko %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group, Organism) %>%
+  group_by(
+    KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group,
+    Organism, total_proteome_linear
+  ) %>%
   summarise(
     ko_org_linear = sum(linear_abundance, na.rm = TRUE),
     n_proteins = n_distinct(Protein),
     .groups = "drop"
+  ) %>%
+  mutate(
+    relative_ko_abundance_taxon = ifelse(
+      is.finite(total_proteome_linear) & total_proteome_linear > 0,
+      ko_org_linear / total_proteome_linear,
+      NA_real_
+    )
   )
 
+# Total abundance of each KO within each biological sample.
 ko_sample_total <- ko_org_sample %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group) %>%
+  group_by(
+    KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group,
+    total_proteome_linear
+  ) %>%
   summarise(
     ko_linear_total = sum(ko_org_linear, na.rm = TRUE),
     .groups = "drop"
+  ) %>%
+  mutate(
+    relative_ko_abundance = ifelse(
+      is.finite(total_proteome_linear) & total_proteome_linear > 0,
+      ko_linear_total / total_proteome_linear,
+      NA_real_
+    )
   )
 
+
 # ============================================================
-# 9. TAXA COLLAPSE: KEEP TOP 20 PER KO x SEX OVERALL
+# 10. TAXA COLLAPSE + GROUP SUMMARY FOR STACKED BARS
 # ============================================================
 
+# Keep the top taxa per KO x Sex based on summed linear KO abundance.
 top_taxa_by_ko_sex <- ko_org_sample %>%
   group_by(KO, Sex, Organism) %>%
   summarise(
@@ -414,72 +490,116 @@ top_taxa_by_ko_sex <- ko_org_sample %>%
   ) %>%
   group_by(KO, Sex) %>%
   arrange(desc(total_abundance), .by_group = TRUE) %>%
-  mutate(rank_taxa = row_number()) %>%
-  mutate(Organism_collapsed = ifelse(rank_taxa <= top_n_taxa, Organism, "Other")) %>%
+  mutate(
+    rank_taxa = row_number(),
+    Organism_collapsed = ifelse(
+      rank_taxa <= top_n_taxa,
+      Organism,
+      "Other"
+    )
+  ) %>%
   ungroup() %>%
   select(KO, Sex, Organism, Organism_collapsed)
 
 ko_org_sample_collapsed <- ko_org_sample %>%
-  left_join(top_taxa_by_ko_sex, by = c("KO", "Sex", "Organism")) %>%
+  left_join(
+    top_taxa_by_ko_sex,
+    by = c("KO", "Sex", "Organism")
+  ) %>%
   mutate(
     Organism_collapsed = coalesce(Organism_collapsed, "Other")
   ) %>%
   group_by(
     KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group,
+    total_proteome_linear,
     Organism = Organism_collapsed
   ) %>%
   summarise(
     ko_org_linear = sum(ko_org_linear, na.rm = TRUE),
     .groups = "drop"
+  ) %>%
+  mutate(
+    relative_ko_abundance_taxon = ifelse(
+      is.finite(total_proteome_linear) & total_proteome_linear > 0,
+      ko_org_linear / total_proteome_linear,
+      NA_real_
+    )
   )
 
-# ============================================================
-# ============================================================
-# 10. SUMMARY FOR STACKED BARS
-#
-# The total height of each bar is normalized to the largest mean
-# KO abundance observed for that KO within the same sex across
-# all Timepoint x Group combinations. Therefore, the largest
-# bar for each KO within each sex equals 1.
-#
-# Taxa segments retain their proportional contribution to total
-# KO abundance within each bar. This normalization is used only
-# for visualization and does not affect the statistical analysis.
-#
-# Because males and females are normalized independently, scaled
-# bar heights should not be used to compare absolute KO abundance
-# between sexes.
-# ============================================================
+# ------------------------------------------------------------
+# Group-level taxonomic contributions
+# ------------------------------------------------------------
+# Each taxon segment is first normalized within each biological sample,
+# then averaged across biological samples in that Timepoint x Group.
 
 ko_org_group_summary <- ko_org_sample_collapsed %>%
   group_by(KO, name, Pathway, Sex, Timepoint, Group, Organism) %>%
   summarise(
     mean_linear = mean(ko_org_linear, na.rm = TRUE),
     median_linear = median(ko_org_linear, na.rm = TRUE),
+    mean_relative_taxon = mean(relative_ko_abundance_taxon, na.rm = TRUE),
+    median_relative_taxon = median(relative_ko_abundance_taxon, na.rm = TRUE),
     n_samples = n_distinct(Sample_ID),
     .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# Group-level total KO relative abundance
+# ------------------------------------------------------------
+# This is explicitly the mean of the SAMPLE-LEVEL normalized KO values.
+
+ko_group_total <- ko_sample_total %>%
+  group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
+  summarise(
+    relative_ko_abundance = mean(relative_ko_abundance, na.rm = TRUE),
+    median_relative_ko_abundance = median(relative_ko_abundance, na.rm = TRUE),
+    mean_ko_linear = mean(ko_linear_total, na.rm = TRUE),
+    n_samples_total = n_distinct(Sample_ID),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# Join bar height back to taxonomic contributions
+# ------------------------------------------------------------
+# Taxa fractions are calculated from the mean sample-level relative
+# contributions, and plot_height is scaled so all taxon segments sum
+# exactly to the mean sample-level relative KO abundance for that bar.
+
+ko_org_group_summary <- ko_org_group_summary %>%
+  left_join(
+    ko_group_total,
+    by = c("KO", "name", "Pathway", "Sex", "Timepoint", "Group")
   ) %>%
   group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
   mutate(
-    total_mean_linear = sum(mean_linear, na.rm = TRUE),
+    total_mean_relative_taxon = sum(mean_relative_taxon, na.rm = TRUE),
     taxa_fraction = ifelse(
-      total_mean_linear > 0,
-      mean_linear / total_mean_linear,
-      0
-    )
-  ) %>%
-  ungroup() %>%
-  group_by(KO, name, Pathway, Sex) %>%
-  mutate(
-    sex_specific_ko_max_mean_linear = max(total_mean_linear, na.rm = TRUE),
-    normalized_total_abundance = ifelse(
-      is.finite(sex_specific_ko_max_mean_linear) & sex_specific_ko_max_mean_linear > 0,
-      total_mean_linear / sex_specific_ko_max_mean_linear,
+      total_mean_relative_taxon > 0,
+      mean_relative_taxon / total_mean_relative_taxon,
       0
     ),
-    plot_height = taxa_fraction * normalized_total_abundance
+    plot_height = taxa_fraction * relative_ko_abundance
   ) %>%
   ungroup()
+
+# ------------------------------------------------------------
+# INTERNAL SCALING CHECK
+# ------------------------------------------------------------
+# For every KO x Sex x Timepoint x Group:
+#   sum(plot_height across taxa)
+# must equal
+#   mean sample-level relative KO abundance
+# apart from floating-point rounding.
+
+ko_relative_scaling_check <- ko_org_group_summary %>%
+  group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
+  summarise(
+    stacked_bar_height = sum(plot_height, na.rm = TRUE),
+    expected_relative_ko_abundance = first(relative_ko_abundance),
+    difference = stacked_bar_height - expected_relative_ko_abundance,
+    .groups = "drop"
+  )
+
 # ============================================================
 # 11. PANEL-LEVEL STATS
 # ============================================================
@@ -509,9 +629,11 @@ ko_taxa_contributor_rank <- ko_org_group_summary %>%
     Organism,
     mean_linear,
     median_linear,
-    total_mean_linear,
-    sex_specific_ko_max_mean_linear,
-    normalized_total_abundance,
+    mean_relative_taxon,
+    median_relative_taxon,
+    relative_ko_abundance,
+    median_relative_ko_abundance,
+    mean_ko_linear,
     taxa_fraction,
     percent_contribution,
     plot_height,
@@ -535,6 +657,7 @@ analysis_parameters <- tibble(
     "Protein-KO mapping file",
     "Abundance scale",
     "Linear abundance calculation",
+    "Proteome denominator",
     "Stacked bar y-axis",
     "Normalization scope",
     "Cross-sex interpretation",
@@ -551,9 +674,10 @@ analysis_parameters <- tibble(
     protein_ko_map_file,
     "Protein-level log2 intensity from expr_imp files",
     "linear_abundance = 2^log2_intensity",
-    "Scaled mean KO abundance (maximum within KO x Sex = 1)",
-    "Maximum calculated separately for each KO x Sex across all Timepoint x Group combinations; visualization only",
-    "Scaled bar heights must not be used to compare absolute KO abundance between males and females",
+    "All measured proteins in each expr_imp sample, calculated before KO filtering",
+    "Relative KO abundance",
+    "Each biological sample is normalized independently: summed linear abundance of proteins assigned to the KO divided by summed linear abundance of ALL measured proteins in that same sample; group means are calculated after sample-level normalization",
+    "Relative KO abundance is directly comparable across experimental conditions because every sample is normalized to its own total measured proteome; interpretation across sexes still depends on comparable proteomic acquisition and preprocessing",
     paste0("Top ", top_n_taxa, " taxa per KO x Sex retained; remaining taxa collapsed as Other"),
     "Wilcoxon rank-sum test",
     "Control vs Dosed within each KO x Sex x Timepoint",
@@ -569,13 +693,23 @@ write_csv(
 )
 
 write_csv(
+  sample_total_proteome,
+  file.path(out_dir, "tables", "sample_total_measured_proteome.csv")
+)
+
+write_csv(
   ko_org_sample_collapsed,
   file.path(out_dir, "tables", "selected_KO_taxa_linear_abundance_per_sample.csv")
 )
 
 write_csv(
   ko_org_group_summary,
-  file.path(out_dir, "tables", "selected_KO_taxa_group_mean_normalized_abundance.csv")
+  file.path(out_dir, "tables", "selected_KO_taxa_group_mean_relative_abundance.csv")
+)
+
+write_csv(
+  ko_relative_scaling_check,
+  file.path(out_dir, "tables", "selected_KO_relative_scaling_check.csv")
 )
 
 write_csv(
@@ -609,9 +743,11 @@ write_xlsx(
     KO_map = ko_map,
     Protein_KO_mapping_used = protein_ko_map,
     KO_contributing_proteins = ko_protein_table,
+    Sample_total_proteome = sample_total_proteome,
     KO_total_linear_per_sample = ko_sample_total,
     KO_taxa_linear_per_sample = ko_org_sample_collapsed,
-    KO_taxa_group_mean_normalized = ko_org_group_summary,
+    KO_taxa_group_mean_relative = ko_org_group_summary,
+    KO_relative_scaling_check = ko_relative_scaling_check,
     KO_taxa_contributor_rank = ko_taxa_contributor_rank,
     KO_panel_stats = panel_stats,
     KO_coverage_summary = ko_coverage
@@ -624,7 +760,7 @@ write_xlsx(
 
 all_taxa_levels <- ko_org_group_summary %>%
   group_by(Organism) %>%
-  summarise(total_abundance = sum(mean_linear, na.rm = TRUE), .groups = "drop") %>%
+  summarise(total_abundance = sum(mean_relative_taxon, na.rm = TRUE), .groups = "drop") %>%
   arrange(desc(total_abundance)) %>%
   pull(Organism)
 
@@ -708,8 +844,8 @@ plot_one_ko_sex <- function(target_ko, target_sex,
   
   detected_timepoints <- one %>%
     filter(
-      !is.na(normalized_total_abundance),
-      normalized_total_abundance > 0
+      !is.na(relative_ko_abundance),
+      relative_ko_abundance > 0
     ) %>%
     distinct(Timepoint) %>%
     pull(Timepoint) %>%
@@ -731,24 +867,24 @@ plot_one_ko_sex <- function(target_ko, target_sex,
       levels = group_levels
     ),
     x = 1.5,
-    y = 0.5,
+    y = 0,
     label = "Not detected"
   )
   
   # ----------------------------------------------------------
-  # Determine maximum abundance in each panel
+  # Determine maximum relative abundance in each panel
   # ----------------------------------------------------------
   
   if (nrow(one) > 0) {
     
     panel_max <- one %>%
-      distinct(Timepoint, Group, normalized_total_abundance) %>%
+      distinct(Timepoint, Group, relative_ko_abundance) %>%
       group_by(Timepoint) %>%
       summarise(
         ymax = ifelse(
-          all(is.na(normalized_total_abundance)),
+          all(is.na(relative_ko_abundance)),
           0,
-          max(normalized_total_abundance, na.rm = TRUE)
+          max(relative_ko_abundance, na.rm = TRUE)
         ),
         .groups = "drop"
       ) %>%
@@ -784,9 +920,9 @@ plot_one_ko_sex <- function(target_ko, target_sex,
       !is.na(p_value)
     ) %>%
     mutate(
-      bracket_y = ymax + 0.07,
-      bracket_y_low = ymax + 0.035,
-      label_y = ymax + 0.11,
+      bracket_y = ymax * 1.10,
+      bracket_y_low = ymax * 1.05,
+      label_y = ymax * 1.23,
       x_start = 1,
       x_end = 2,
       label_x = 1.5,
@@ -794,10 +930,11 @@ plot_one_ko_sex <- function(target_ko, target_sex,
     )
   
   # ----------------------------------------------------------
-  # Set a suitable common y-axis
+
+  # Set a suitable KO-specific y-axis
   # ----------------------------------------------------------
   
-  abundance_values <- one$normalized_total_abundance
+  abundance_values <- one$relative_ko_abundance
   abundance_values <- abundance_values[
     is.finite(abundance_values)
   ]
@@ -808,9 +945,20 @@ plot_one_ko_sex <- function(target_ko, target_sex,
   ]
   
   y_top <- max(
-    c(abundance_values, stat_values, 1),
+    c(abundance_values, stat_values),
     na.rm = TRUE
-  ) + 0.15
+  )
+  
+  # Add ~10% headroom above the highest bar/annotation
+  if (!is.finite(y_top) || y_top <= 0) {
+    y_top <- 0.10
+  } else {
+    y_top <- y_top * 1.10
+  }
+
+  # Place "Not detected" labels inside the actual y-axis range.
+  missing_labels <- missing_labels %>%
+    mutate(y = y_top * 0.45)
   
   # ----------------------------------------------------------
   # Construct plot
@@ -875,7 +1023,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
         label = stat_text
       ),
       inherit.aes = FALSE,
-      size = 5.1,
+      size = 5,
       fontface = "bold"
     ) +
     
@@ -911,8 +1059,10 @@ plot_one_ko_sex <- function(target_ko, target_sex,
     
     scale_y_continuous(
       limits = c(0, y_top),
-      breaks = seq(0, 1, by = 0.25),
-      labels = scales::number_format(accuracy = 0.01),
+      breaks = scales::pretty_breaks(n = 5),
+      labels = scales::label_percent(
+        accuracy = 0.001
+      ),
       expand = expansion(mult = c(0.02, 0.04))
     ) +
     
@@ -920,7 +1070,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
       title = plot_title,
       subtitle = plot_subtitle,
       x = NULL,
-      y = "Scaled mean KO abundance",
+      y = "Relative KO abundance (%)",
       fill = "Taxa"
     ) +
     
@@ -929,7 +1079,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
     theme(
       plot.title = element_text(
         face = "bold",
-        size = 15
+        size = 17
       ),
       plot.subtitle = element_text(
         face = "bold",
@@ -943,13 +1093,13 @@ plot_one_ko_sex <- function(target_ko, target_sex,
         fill = "grey85",
         color = "grey50",
         linewidth = 0.6
-      ),
+      ), 
       axis.text.x = element_text(
         face = "bold",
-        size = 11
+        size = 10
       ),
       axis.text.y = element_text(
-        size = 10
+        size = 9
       ),
       panel.grid.major.x = element_blank(),
       panel.grid.minor = element_blank(),
@@ -964,7 +1114,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
       ),
       legend.text = element_text(
         face = "bold",
-        size = 9
+        size = 13
       ),
       plot.margin = margin(12, 12, 12, 12)
     )
@@ -977,7 +1127,7 @@ plot_one_ko_sex <- function(target_ko, target_sex,
     clean_filename(ko_name),
     clean_filename(target_ko),
     clean_filename(target_sex),
-    "stacked_taxa_normalized_max",
+    "stacked_taxa_relative_proteome",
     sep = "_"
   )
   
@@ -1040,9 +1190,9 @@ for (i in seq_len(nrow(plot_keys))) {
     target_sex = this_sex,
     df_plot = ko_org_group_summary,
     df_stats = panel_stats,
-    out_dir_tiff = file.path(out_dir, "plots", "normalized_max_stacked_taxa", "tiff"),
-    out_dir_png  = file.path(out_dir, "plots", "normalized_max_stacked_taxa", "png"),
-    out_dir_pdf  = file.path(out_dir, "plots", "normalized_max_stacked_taxa", "pdf")
+    out_dir_tiff = file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "tiff"),
+    out_dir_png  = file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "png"),
+    out_dir_pdf  = file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "pdf")
   )
 }
 
@@ -1055,4 +1205,20 @@ write_csv(
   )
 )
 message("Done.")
+
+ko_org_group_summary %>%
+  filter(
+    KO == "K01186",
+    Sex == "Females"
+  ) %>%
+  distinct(
+    Timepoint,
+    Group,
+    relative_ko_abundance,
+    median_relative_ko_abundance,
+    mean_ko_linear,
+    n_samples_total
+  ) %>%
+  arrange(Timepoint, Group)
+
 
