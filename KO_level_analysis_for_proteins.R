@@ -1,1224 +1,1005 @@
-# ============================================================
-# KO-LEVEL STACKED BAR PLOTS FROM expr_imp FILES
-# STACK BY TAXA
-# SAMPLE-LEVEL NORMALIZATION TO TOTAL MEASURED PROTEOME
-#
-# BARS:
-#   For each biological sample, summed linear KO abundance is divided by
-#   the summed linear abundance of ALL measured proteins in that same sample.
-#   Control/Dosed bars are then the mean sample-level relative KO abundance.
-#   Taxa segments retain their proportional contribution to the KO bar.
-#
-# STATS:
-#   PATHWAY-STYLE KO-LEVEL WILCOXON
-#   Uses protein-level log2_intensity values
-#   Control vs Dosed within each Timepoint and Sex
-#   BH-adjusted within Pathway x Sex
-#
-# INPUTS USED
-#   - expr_imp_* files (sample-level log2 intensities)
-#   - KO_map_file.xlsx
-#   - Pathway_intermediate_tables/Protein_KO_membership_all_sources.csv
-#   - six limma summary .xlsx files (for organism extraction via Function)
-# ============================================================
 
+needed <- c('readxl','readr','dplyr','tidyr','tibble','stringr',
+            'purrr','ggplot2')
+missing <- needed[!vapply(needed,requireNamespace,logical(1),quietly=TRUE)]
+if (length(missing)) stop('Install these packages first: ',paste(missing,collapse=', '))
 suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(stringr)
-  library(readr)
-  library(readxl)
-  library(writexl)
+  library(readxl); library(readr); library(dplyr); library(tidyr)
+  library(tibble); library(stringr); library(purrr)
   library(ggplot2)
-  library(forcats)
-  library(purrr)
-  library(scales)
 })
 
-# ============================================================
-# 0. SETTINGS
-# ============================================================
+# 1. User settings ----------------------------------------------------------
+root <- paste0('/Users/oluwatosinshittu/Library/CloudStorage/',
+               'OneDrive-BaylorUniversity/proteomics_LIMAR_all timepoints')
+limma_dir <- file.path(root,'Litter_analysis','Final_Litter_Blocked_Limma')
+old_dir <- file.path(root,'Pathway_Enrichment_specific',
+                     'high_confidence_hits','KO_summary','Pathway_intermediate_tables')
+old_ko_file <- file.path(old_dir,'Protein_KO_pathway_membership.csv')
+old_membership_file <- file.path(old_dir,'Expression_with_pathway_membership.csv')
+old_names_file <- file.path(old_dir,'Selected_KO_name_lookup.csv')
+# Additional KO roster: may contain KOs without any significant protein.
+ko_reference_file <- file.path(root,'Litter_analysis','KO_map_file.xlsx')
+if(!file.exists(ko_reference_file))
+  stop('Missing requested KO roster workbook: ',ko_reference_file)
 
-setwd("/data/proteomics/KO_level_analysis")
+# Keep previous KO plots unchanged; save the new figures separately.
+out_dir <- file.path(root, 'Litter_analysis',
+                     'KO_Map_OkabeIto_ContrastOptimized_TIFFs')
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+audit_dir <- file.path(out_dir, 'Audit_Tables')
+dir.create(audit_dir, recursive=TRUE, showWarnings=FALSE)
+# Reuse the precise group definition exported by the UPDATED pathway script.
+# The source filtered TSVs were inspected in that script, not here.
+lookup_file <- file.path(root, 'Litter_analysis',
+                         'Selected_pathway_ExactPeptides_ExactRawValues_Litter_Blocked_LIMMA',
+                         'tables', 'KO_protein_group_lookup_FROM_FILTERED.csv')
+if (!file.exists(lookup_file)) stop(
+  'Missing exact-original-evidence lookup. Run the REVISED selected-pathway script first:\n',
+  lookup_file)
 
-out_dir <- "KO_selected_abundance_stacked_by_taxa_relative_proteome"
-dir.create(out_dir, showWarnings = FALSE)
-dir.create(file.path(out_dir, "tables"), showWarnings = FALSE)
-dir.create(file.path(out_dir, "plots"), showWarnings = FALSE)
 
-# ---- Relative abundance stacked taxa plot folders ----
-dir.create(
-  file.path(out_dir, "plots", "relative_proteome_stacked_taxa"),
-  recursive = TRUE,
-  showWarnings = FALSE
-)
+# SIGNIFICANCE: inherited only for groups with agreeing existing litter-aware stats.
+fdr_cutoff <- 0.05
+abs_logfc_cutoff <- 1.5
+# All KOs in KO_map_file.xlsx will be plotted; no significance-based KO exclusions.
 
-dir.create(
-  file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "tiff"),
-  recursive = TRUE,
-  showWarnings = FALSE
-)
+# Export settings
+plot_dpi <- 600
+protein_max_chars <- 23
+organism_max_chars <- 34
 
-dir.create(
-  file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "png"),
-  recursive = TRUE,
-  showWarnings = FALSE
-)
 
-dir.create(
-  file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "pdf"),
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-plot_width  <- 9
-plot_height <- 6
-plot_dpi    <- 600
+expected <- c('5W_M','8W_M','12W_M','5W_F','8W_F','12W_F')
+time_levels <- c('5W','8W','12W')
+sex_levels <- c('Males','Females')
 
-top_n_taxa <- 12
+# EXACT original pathway list (from previous individual-protein KO code).
+selected_pathways <- tibble::tribble(
+  ~analysis_theme, ~pathway_id, ~preferred_pathway_name,
+  'SCFA metabolism','map00650','Butanoate metabolism',
+  'SCFA metabolism','map00640','Propanoate metabolism',
+  'Aromatic amino acids','map00380','Tryptophan metabolism',
+  'Aromatic amino acids','map00360','Phenylalanine metabolism',
+  'Aromatic amino acids','map00350','Tyrosine metabolism',
+  'Aromatic amino acids','map00400','Phenylalanine, tyrosine and tryptophan biosynthesis',
+  'Bile acids / host interaction','map00120','Primary bile acid biosynthesis',
+  'Bile acids / host interaction','map00121','Secondary bile acid biosynthesis',
+  'Bile acids / host interaction','map04976','Bile secretion',
+  'Chemical stress / redox','map00480','Glutathione metabolism',
+  'Chemical stress / redox','map02010','ABC transporters',
+  'Chemical stress / redox','map00920','Sulfur metabolism',
+  'Host-microbe interface','map00540','Lipopolysaccharide biosynthesis',
+  'Host-microbe interface','map00511','Other glycan degradation',
+  'Host-microbe interface','map00531','Glycosaminoglycan degradation',
+  'Host-microbe interface','map00520','Amino sugar and nucleotide sugar metabolism',
+  'Polyamine-related source pathways','map00330','Arginine and proline metabolism',
+  'Polyamine-related source pathways','map00270','Cysteine and methionine metabolism',
+  'Polyamine-related source pathways','map00220','Arginine biosynthesis',
+  'Glucuronate-related metabolism','map00040','Pentose and glucuronate interconversions',
+  'Glucuronate-related metabolism','map00053','Ascorbate and aldarate metabolism',
+  'PAH / xenobiotic-related','map00624','Polycyclic aromatic hydrocarbon degradation',
+  'PAH / xenobiotic-related','map00626','Naphthalene degradation',
+  'PAH / xenobiotic-related','map00362','Benzoate degradation',
+  'PAH / xenobiotic-related','map00627','Aminobenzoate degradation',
+  'PAH / xenobiotic-related','map00980','Metabolism of xenobiotics by cytochrome P450',
+  'PAH / xenobiotic-related','map00982','Drug metabolism - cytochrome P450',
+  'PAH / xenobiotic-related','map00983','Drug metabolism - other enzymes',
+  'Oxidative stress / ROS-related','map00190','Oxidative phosphorylation',
+  'Oxidative stress / ROS-related','map04146','Peroxisome',
+  'Lipid metabolism','map00071','Fatty acid degradation',
+  'Lipid metabolism','map00564','Glycerophospholipid metabolism'
+) %>% distinct(pathway_id,.keep_all=TRUE)
 
-# ============================================================
-# 1. FILES
-# ============================================================
-
-expr_files <- c(
-  "expr_imp_5wks_M_8_2_3_0.05.xlsx",
-  "expr_imp_8wks_M_8_2_3_0.05.xlsx",
-  "expr_imp_12wks_M_8_2_3_0.05.xlsx",
-  "expr_imp_5wks_F_8_2_3_0.05.xlsx",
-  "expr_imp_8wks_F_8_2_3_0.05.xlsx",
-  "expr_imp_12wks_F_8_2_3_0.05.xlsx"
-)
-
-limma_files <- c(
-  "5wks_M_8_2_3_0.05.xlsx",
-  "8wks_M_8_2_3_0.05.xlsx",
-  "12wks_M_8_2_3_0.05.xlsx",
-  "5wks_F_8_2_3_0.05.xlsx",
-  "8wks_F_8_2_3_0.05.xlsx",
-  "12wks_F_8_2_3_0.05.xlsx"
-)
-
-ko_map_file <- "KO_map_file.xlsx"
-protein_ko_map_file <- file.path("Pathway_intermediate_tables", "Protein_KO_membership_all_sources.csv")
-
-# ============================================================
-# 2. HELPERS
-# ============================================================
-
-clean_filename <- function(x) {
-  x %>%
-    str_replace_all("[^A-Za-z0-9]+", "_") %>%
-    str_replace_all("^_+|_+$", "")
+# 2. Helpers ----------------------------------------------------------------
+clean_file <- function(s) {
+  x <- stringr::str_replace_all(as.character(s),'[^A-Za-z0-9]+','_')
+  x <- stringr::str_replace_all(x,'^_+|_+$','')
+  substr(ifelse(is.na(x)|!nzchar(x),'Unknown',x),1,85)
+}
+first_valid <- function(x) {
+  x <- stringr::str_squish(as.character(x))
+  x <- x[!is.na(x)&nzchar(x)&!x %in% c('NA','None','-')]
+  if(length(x)) x[[1]] else NA_character_
+}
+most_common <- function(x) {
+  x <- stringr::str_squish(as.character(x))
+  x <- x[!is.na(x)&nzchar(x)&!x %in% c('NA','None','Unknown taxon','Unknown taxa','Taxon unresolved','Unknown organism','-')]
+  if(!length(x)) return(NA_character_)
+  tab <- sort(table(x),decreasing=TRUE)
+  names(tab)[[1]]
+}
+pick_col <- function(nms,candidates) {
+  i <- match(tolower(candidates),tolower(nms))
+  i <- i[!is.na(i)]
+  if(length(i)) nms[[i[[1]]]] else NA_character_
+}
+normalize_sex <- function(z) {
+  z <- toupper(trimws(as.character(z)))
+  dplyr::case_when(z %in% c('M','MALE','MALES')~'M',
+                   z %in% c('F','FEMALE','FEMALES')~'F',TRUE~NA_character_)
 }
 
-extract_timepoint_from_expr <- function(x) {
-  case_when(
-    str_detect(x, "5wks")  ~ "5W",
-    str_detect(x, "8wks")  ~ "8W",
-    str_detect(x, "12wks") ~ "12W",
-    TRUE ~ NA_character_
-  )
+# Use descriptive metadata only; never edit identifiers used for data joins.
+clean_protein_label <- function(x) {
+  x <- trimws(as.character(x))
+  x <- sub('^>+','',x)
+  x <- sub('^(sp|tr|ref|gb|emb|dbj)\\|([^|]+)\\|.*$','\\2',x,perl=TRUE)
+  x <- sub('^UniRef(50|90|100)_','',x,ignore.case=TRUE)
+  x <- sub('\\s+.*$','',x)
+  x[is.na(x)|!nzchar(x)] <- 'Unknown protein'
+  x
 }
 
-extract_sex_from_expr <- function(x) {
-  case_when(
-    str_detect(x, "_M_") ~ "Males",
-    str_detect(x, "_F_") ~ "Females",
-    TRUE ~ NA_character_
-  )
+# If a text column contains Tax= / OS= / [organism], extract a taxon conservatively.
+extract_taxon <- function(z) {
+  vapply(as.character(z),function(s) {
+    if(is.na(s)||!nzchar(trimws(s))) return(NA_character_)
+    s <- stringr::str_squish(s)
+    m <- stringr::str_match(s,stringr::regex('\\bTax\\s*=\\s*(.*?)(?=\\s+(?:TaxID|RepID|OX|GN|PE|SV)\\s*=|$)',ignore_case=TRUE))
+    if(!is.na(m[1,2])) return(m[1,2])
+    m <- stringr::str_match(s,stringr::regex('\\bOS\\s*=\\s*(.*?)(?=\\s+(?:TaxID|OX|GN|PE|SV)\\s*=|$)',ignore_case=TRUE))
+    if(!is.na(m[1,2])) return(m[1,2])
+    b <- stringr::str_extract_all(s,'\\[[^\\]]+\\]')[[1]]
+    if(length(b)) {
+      b <- gsub('^\\[|\\]$','',b)
+      b <- b[!grepl('^(EC\\s*:|KO\\s*:|K[0-9]{5}$)',b,ignore.case=TRUE)]
+      if(length(b)) return(tail(b,1))
+    }
+    NA_character_
+  },character(1))
+}
+clean_taxon <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_replace_all(x,'^\\[|\\]$','')
+  x <- stringr::str_replace(x,stringr::regex('^.*?\\b(?:Tax|OS)\\s*=\\s*',ignore_case=TRUE),'')
+  x <- stringr::str_replace(x,stringr::regex('\\s+(?:TaxID|RepID|OX|GN|PE|SV)\\s*=.*$',ignore_case=TRUE),'')
+  # Suppress strain/isolate codes for display only; retain full taxon in output.
+  x <- stringr::str_replace(x,stringr::regex('\\s+(?:subsp\\.|strain|str\\.|isolate|ATCC|DSM|JCM|NCTC|NBRC)\\b.*$',ignore_case=TRUE),'')
+  x <- stringr::str_replace_all(x,'[\\[\\]]','')
+  x <- stringr::str_squish(x)
+  x[is.na(x)|!nzchar(x)|
+      grepl('^(EC\\s*:|K[0-9]{5}$|NA$)', x, ignore.case=TRUE) |
+      tolower(x) %in% c('unknown taxon','unknown taxa','taxon unresolved',
+                        'unknown organism','unclassified','-')] <- 'Unknown taxa'
+  x
 }
 
-extract_timepoint_from_limma <- function(x) {
-  case_when(
-    str_detect(x, "^5wks_")  ~ "5W",
-    str_detect(x, "^8wks_")  ~ "8W",
-    str_detect(x, "^12wks_") ~ "12W",
-    TRUE ~ NA_character_
-  )
+clean_ko_name <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_remove_all(x,'\\s*\\[EC[^\\]]*\\]')
+  stringr::str_squish(x)
 }
 
-extract_sex_from_limma <- function(x) {
-  case_when(
-    str_detect(x, "_M_") ~ "Males",
-    str_detect(x, "_F_") ~ "Females",
-    TRUE ~ NA_character_
-  )
-}
 
-extract_organism <- function(x) {
-  out <- rep(NA_character_, length(x))
+read_ko_reference <- function(fp) {
+  tabs <- readxl::excel_sheets(fp)
+  gathered <- list()
+  n <- 0L
+  ko_pattern <- '(?<![A-Za-z0-9])K[0-9]{5}(?![0-9])'
   
-  idx_bracket <- str_detect(x, "\\[[^\\]]+\\]")
-  out[idx_bracket] <- str_match(x[idx_bracket], "\\[([^\\]]+)\\]")[, 2]
+  for (sh in tabs) {
+    tab <- readxl::read_excel(fp, sheet=sh, col_types='text',
+                              .name_repair='unique')
+    if (!nrow(tab)) next
+    headers <- names(tab)
+    canon <- tolower(gsub('[^A-Za-z0-9]+','',headers))
+    
+    # Locate the KO-ID column by both its header and actual K##### contents.
+    has_ko <- vapply(tab, function(v) {
+      any(stringr::str_detect(toupper(as.character(v)),ko_pattern),na.rm=TRUE)
+    }, logical(1))
+    id_priority <- c('ko','koid','konumber','keggid','keggko',
+                     'keggortholog','keggorthologid','orthologid',
+                     'ortholog','kofamid','eggnogko')
+    id_named <- which(canon %in% id_priority)
+    id_named <- id_named[order(match(canon[id_named],id_priority))]
+    id_other <- which(grepl('ko|kegg|ortholog|kofam|eggnog',canon) &
+                        !grepl('name|desc|definition|function|annotation|label',canon))
+    id_candidates <- unique(c(id_named,id_other,which(has_ko)))
+    id_candidates <- id_candidates[has_ko[id_candidates]]
+    if (!length(id_candidates)) {
+      warning('No KO IDs found in sheet: ',sh)
+      next
+    }
+    id_col <- id_candidates[[1]]
+    
+    # A named KO description wins over a generic protein function/annotation.
+    name_priority <- c('koname','kopreferredname','kodisplayname',
+                       'kodescription','kodefinition','kofunction',
+                       'orthologname','orthologdescription',
+                       'keggname','keggdescription','preferredname',
+                       'displayname','enzymename','name','description',
+                       'definition','function','enzyme','product',
+                       'genename','gene','annotation')
+    exact <- which(canon %in% name_priority & seq_along(canon)!=id_col)
+    exact <- exact[order(match(canon[exact],name_priority))]
+    other <- which(grepl('name|description|definition|function|enzyme|product|label|gene',canon) &
+                     seq_along(canon)!=id_col)
+    name_candidates <- unique(c(exact,other))
+    
+    ko_txt <- toupper(as.character(tab[[id_col]]))
+    ko_names_in_sheet <- rep(NA_character_,nrow(tab))
+    for (ci in name_candidates) {
+      v <- stringr::str_squish(as.character(tab[[ci]]))
+      v[tolower(v) %in% c('','na','n/a','none','-','unknown')] <- NA_character_
+      fill <- is.na(ko_names_in_sheet) & !is.na(v)
+      ko_names_in_sheet[fill] <- v[fill]
+    }
+    
+    # Optional fallback: an ID cell such as "K01034 | butyryl-CoA transferase".
+    # A bare ID or a cell holding multiple IDs is NOT treated as a KO name.
+    for (r in seq_len(nrow(tab))) {
+      if (is.na(ko_txt[r])) next
+      ids <- unique(unlist(stringr::str_extract_all(ko_txt[r],ko_pattern)))
+      ids <- ids[!is.na(ids)]
+      if (!length(ids)) next
+      ko_name <- ko_names_in_sheet[r]
+      if (is.na(ko_name) && length(ids)==1L) {
+        raw <- stringr::str_squish(as.character(tab[[id_col]][r]))
+        # Only accept a description AFTER a leading KO ID; "KO: K01034"
+        # is merely an ID cell, not a name.
+        suffix <- stringr::str_match(raw,
+                                     stringr::regex('^K[0-9]{5}\\s*(?:[|:;,_=-]\\s*|\\s+)(.+)$',
+                                                    ignore_case=TRUE))[,2]
+        if (!is.na(suffix) && nzchar(stringr::str_squish(suffix)))
+          ko_name <- stringr::str_squish(suffix)
+      }
+      n <- n+1L
+      gathered[[n]] <- tibble::tibble(
+        KO=ids,KO_map_name=rep(ko_name,length(ids)),
+        Source_sheet=sh,Source_row=r+1L,
+        KO_ID_column=headers[id_col],
+        KO_name_column=if(length(name_candidates))
+          paste(headers[name_candidates],collapse=' | ') else NA_character_)
+    }
+    message('KO map sheet "',sh,'": ID column = ',headers[id_col],
+            '; preferred name column = ',
+            if(length(name_candidates)) headers[name_candidates[1]] else '[none detected]')
+  }
   
-  idx_tax <- is.na(out) & str_detect(x, "Tax=")
-  out[idx_tax] <- str_match(
-    x[idx_tax],
-    "Tax=([^\\[]+?)(?:\\s+TaxID=|\\s+RepID=|$)"
-  )[, 2]
+  if (!length(gathered)) stop('No K##### identifiers found in: ',fp)
+  all_rows <- dplyr::bind_rows(gathered) %>%
+    dplyr::mutate(KO_map_name=dplyr::na_if(
+      stringr::str_squish(KO_map_name),''))
   
-  out <- str_squish(out)
-  out[out == ""] <- NA_character_
-  out
+  # Flag contradictory names rather than silently hiding them.
+  conflicts <- all_rows %>%
+    dplyr::filter(!is.na(KO_map_name)) %>%
+    dplyr::group_by(KO) %>%
+    dplyr::summarise(n_distinct_names=dplyr::n_distinct(KO_map_name),
+                     names_in_workbook=paste(unique(KO_map_name),collapse=' | '),
+                     .groups='drop') %>%
+    dplyr::filter(n_distinct_names>1L)
+  
+  if (nrow(conflicts)) warning(nrow(conflicts),
+                               ' KO IDs have different names in the workbook; see QC_KO_map_conflicting_names.csv')
+  
+  # One KO = one preferred label. Prefer the first NONEMPTY workbook name.
+  all_rows %>%
+    dplyr::arrange(KO,dplyr::desc(!is.na(KO_map_name))) %>%
+    dplyr::distinct(KO,.keep_all=TRUE)
 }
+ko_reference <- read_ko_reference(ko_reference_file)
+message('Read ',nrow(ko_reference),' KO identifiers from KO_map_file.xlsx; ',
+        sum(!is.na(ko_reference$KO_map_name)),' with workbook names')
 
-p_to_stars <- function(p) {
-  case_when(
-    is.na(p)   ~ "ns",
-    p < 1e-4   ~ "****",
-    p < 1e-3   ~ "***",
-    p < 1e-2   ~ "**",
-    p < 5e-2   ~ "*",
-    TRUE       ~ "ns"
-  )
-}
+if (all(is.na(ko_reference$KO_map_name)))
+  stop('Found KO IDs in KO_map_file.xlsx but NO KO names. ',
+       'Check that its name/description column was recognized. ',
+       'Review the workbook headers and the KO map QC CSV.')
 
-make_taxa_palette <- function(taxa_levels) {
-  base_cols <- c(
-    "#1b9e77", "#d95f02", "#7570b3", "#e7298a",
-    "#66a61e", "#e6ab02", "#a6761d", "#6a3d9a",
-    "#1f78b4", "#b2df8a", "#fb9a99", "#fdbf6f",
-    "#cab2d6", "#ffff99"
-  )
+# 3. Read ONLY original KO and per-dataset pathway membership ---------------
+for(f in c(old_ko_file,old_membership_file))
+  if(!file.exists(f)) stop('Required ORIGINAL annotation file not found: ',f)
+
+map0 <- readr::read_csv(old_ko_file,show_col_types=FALSE)
+req <- c('Protein','KO','pathway_id')
+if(!all(req %in% names(map0))) stop('Original KO mapping missing: ',paste(setdiff(req,names(map0)),collapse=', '))
+for(col in c('pathway_name','broad_category','subcategory','Function_from_annotation'))
+  if(!col %in% names(map0)) map0[[col]] <- NA_character_
+map0 <- map0 %>%
+  transmute(Protein=trimws(as.character(Protein)),KO=trimws(as.character(KO)),
+            pathway_id=trimws(as.character(pathway_id)),
+            pathway_name=as.character(pathway_name),
+            broad_category=as.character(broad_category),
+            subcategory=as.character(subcategory),
+            Function_from_annotation=as.character(Function_from_annotation)) %>%
+  filter(!is.na(Protein),nzchar(Protein),grepl('^K[0-9]{5}$',KO),
+         !is.na(pathway_id),nzchar(pathway_id)) %>%
+  distinct(Protein,KO,pathway_id,.keep_all=TRUE)
+old_expr <- readr::read_csv(old_membership_file,show_col_types=FALSE)
+req <- c('Protein','Sex','Timepoint','pathway_id')
+if(!all(req %in% names(old_expr))) stop('Original expression/pathway mapping missing: ',paste(setdiff(req,names(old_expr)),collapse=', '))
+old_present <- old_expr %>%
+  transmute(Protein=trimws(as.character(Protein)),
+            pathway_id=trimws(as.character(pathway_id)),
+            SexCode=normalize_sex(Sex),
+            Timepoint=toupper(trimws(as.character(Timepoint)))) %>%
+  mutate(Dataset=paste(Timepoint,SexCode,sep='_')) %>%
+  filter(Dataset %in% expected,!is.na(Protein),nzchar(Protein),
+         !is.na(pathway_id),nzchar(pathway_id)) %>%
+  distinct(Dataset,Protein,pathway_id)
+if(!nrow(old_present)) stop('No original sex/timepoint-specific pathway memberships found.')
+
+
+original_mapping <- map0 %>%
+  left_join(selected_pathways,by='pathway_id') %>%
+  filter(!is.na(analysis_theme) | KO %in% ko_reference$KO) %>%
+  mutate(analysis_theme=coalesce(analysis_theme,'Additional KOs from KO_map_file'),
+         pathway_name=coalesce(na_if(pathway_name,''),preferred_pathway_name,pathway_id),
+         broad_category=coalesce(broad_category,'Unclassified'),
+         subcategory=coalesce(subcategory,'Unclassified')) %>%
+  select(-preferred_pathway_name) %>%
+  distinct(Protein,KO,pathway_id,.keep_all=TRUE)
+if(!nrow(original_mapping)) stop('No KO assignments matched original mapping.')
+
+
+ko_reference_qc <- ko_reference %>%
+  mutate(In_original_protein_KO_map=KO %in% map0$KO,
+         In_original_dataset_pathway=KO %in%
+           (map0 %>% semi_join(old_present,by=c('Protein','pathway_id')) %>% pull(KO)))
+
+message('KO roster with original dataset-specific mapping: ',
+        sum(ko_reference_qc$In_original_dataset_pathway),' / ',nrow(ko_reference_qc))
+
+# 4. Load new litter-BLOCKED protein-level limma results ---------------------
+read_one <- function(id) {
+  fp <- file.path(limma_dir,paste0(id,'_Litter_Blocked_Protein_Results.xlsx'))
+  if(!file.exists(fp)) stop('Missing NEW litter-blocked workbook: ',fp)
+  tabs <- readxl::excel_sheets(fp)
+  if(!'Protein_Statistics' %in% tabs) stop(id,': missing Protein_Statistics sheet')
+  dat <- readxl::read_excel(fp,sheet='Protein_Statistics')
+  needed_stats <- c('Protein','log2FC','p_value','BH_FDR')
+  if(!all(needed_stats %in% names(dat)))
+    stop(id,': Protein_Statistics missing: ',paste(setdiff(needed_stats,names(dat)),collapse=', '))
+  dat$Protein <- trimws(as.character(dat$Protein))
+  if(anyDuplicated(dat$Protein)) stop(id,': duplicate IDs in Protein_Statistics')
   
-  special_taxa <- c("Other", "Unknown organism")
-  regular_taxa <- setdiff(taxa_levels, special_taxa)
-  
-  n_regular <- length(regular_taxa)
-  
-  if (n_regular <= length(base_cols)) {
-    cols_regular <- base_cols[seq_len(n_regular)]
+  # Prefer explicit original function/organism fields; never infer taxon from KO.
+  ann_tab <- if('Function_Annotation' %in% tabs) 'Function_Annotation' else
+    if('Protein_Annotated_Results' %in% tabs) 'Protein_Annotated_Results' else NA_character_
+  if(is.na(ann_tab)) {
+    warning(id,': no annotation sheet; taxonomy will be Unknown taxa')
+    anno <- tibble(Protein=character(),Function=character(),Taxon_raw=character())
   } else {
-    cols_regular <- colorRampPalette(base_cols)(n_regular)
+    aa <- readxl::read_excel(fp,sheet=ann_tab)
+    if(!'Protein' %in% names(aa)) stop(id,': annotation sheet lacks Protein')
+    aa$Protein <- trimws(as.character(aa$Protein))
+    if(anyDuplicated(aa$Protein)) stop(id,': duplicate IDs in annotation sheet')
+    fcol <- pick_col(names(aa),c('Function','Description','Protein.Description',
+                                 'Protein description','Protein_Function','Annotation'))
+    tcol <- pick_col(names(aa),c('Organism','organism_name','Organism Name',
+                                 'Taxon','Taxon name','Species','Taxonomy',
+                                 'Organism/Taxon','Taxonomic assignment'))
+    fun <- if(!is.na(fcol)) as.character(aa[[fcol]]) else rep(NA_character_,nrow(aa))
+    tx <- if(!is.na(tcol)) as.character(aa[[tcol]]) else rep(NA_character_,nrow(aa))
+    parsed <- extract_taxon(fun)
+    tx[is.na(tx)|!nzchar(trimws(tx))] <- parsed[is.na(tx)|!nzchar(trimws(tx))]
+    anno <- tibble(Protein=aa$Protein,Function=fun,Taxon_raw=tx)
   }
-  
-  pal <- setNames(cols_regular, regular_taxa)
-  
-  if ("Other" %in% taxa_levels) {
-    pal["Other"] <- "grey70"
-  }
-  if ("Unknown organism" %in% taxa_levels) {
-    pal["Unknown organism"] <- "grey40"
-  }
-  
-  pal[taxa_levels]
+  parts <- strsplit(id,'_',fixed=TRUE)[[1]]
+  dat %>% transmute(
+    Dataset=id,Protein,
+    Sex=if(parts[2]=='M') 'Males' else 'Females',
+    Timepoint=parts[1],
+    logFC=as.numeric(log2FC),
+    P.Value=as.numeric(p_value),
+    adj.P.Val=as.numeric(BH_FDR),
+    limma_source_file=basename(fp)
+  ) %>%
+    left_join(anno,by='Protein',relationship='many-to-one') %>%
+    mutate(Taxon_raw=as.character(Taxon_raw),
+           Organism=clean_taxon(Taxon_raw),
+           Function=as.character(Function))
+}
+limma_all <- purrr::map_dfr(expected,read_one)
+if(!nrow(limma_all)) stop('No protein-level limma rows loaded')
+if(anyDuplicated(limma_all[c('Dataset','Protein')])) stop('Duplicate dataset/protein limma statistics')
+
+
+ko_protein <- limma_all %>%
+  inner_join(original_mapping,by='Protein',relationship='many-to-many') %>%
+  semi_join(old_present,by=c('Dataset','Protein','pathway_id')) %>%
+  distinct(Dataset,Protein,KO,pathway_id,.keep_all=TRUE) %>%
+  mutate(Significant=is.finite(adj.P.Val)&adj.P.Val<fdr_cutoff&
+           is.finite(logFC)&abs(logFC)>=abs_logfc_cutoff,
+         Direction=case_when(Significant & logFC>0 ~ 'Enriched in dosed',
+                             Significant & logFC<0 ~ 'Depleted in dosed',
+                             TRUE ~ 'N/S'),
+         neg_log10_adj_p=ifelse(!is.na(adj.P.Val)&adj.P.Val>0,
+                                -log10(adj.P.Val),NA_real_))
+if(!nrow(ko_protein)) stop('No proteins matched ORIGINAL KO and dataset/pathway membership.')
+if(anyDuplicated(ko_protein[c('Dataset','Protein','KO','pathway_id')]))
+  stop('Duplicate dataset-protein-KO-pathway results detected')
+
+
+mapping_qc <- limma_all %>%
+  inner_join(original_mapping,by='Protein',relationship='many-to-many') %>%
+  mutate(Present_original_dataset_pathway=
+           paste(Dataset,Protein,pathway_id,sep='||') %in%
+           paste(old_present$Dataset,old_present$Protein,old_present$pathway_id,sep='||')) %>%
+  group_by(Dataset,pathway_id) %>%
+  summarise(Global_KO_proteins=n_distinct(Protein),
+            Originally_present_proteins=n_distinct(Protein[Present_original_dataset_pathway]),
+            Excluded_global_only=n_distinct(Protein[!Present_original_dataset_pathway]),
+            .groups='drop')
+
+naph_qc <- tibble(Dataset=expected) %>%
+  left_join(old_present %>% filter(pathway_id=='map00626') %>%
+              count(Dataset,name='Original_protein_memberships'),by='Dataset') %>%
+  left_join(ko_protein %>% filter(pathway_id=='map00626') %>%
+              group_by(Dataset) %>%
+              summarise(Matched_proteins=n_distinct(Protein),.groups='drop'),by='Dataset') %>%
+  mutate(across(c(Original_protein_memberships,Matched_proteins),~replace_na(.x,0L)))
+
+print(naph_qc,n=Inf)
+if(any(naph_qc$Original_protein_memberships==0 & naph_qc$Matched_proteins>0))
+  stop('Naphthalene membership mismatch: an originally absent pathway appeared.')
+
+ko_cache <- if (file.exists(old_names_file))
+  readr::read_csv(old_names_file,show_col_types=FALSE) else
+    tibble(KO=character(),KO_name=character())
+if (!'KO' %in% names(ko_cache))
+  ko_cache <- tibble(KO=character(),KO_name=character())
+if (!'KO_name' %in% names(ko_cache)) ko_cache$KO_name <- NA_character_
+ko_cache <- ko_cache %>%
+  transmute(KO=as.character(KO),KO_name=as.character(KO_name)) %>%
+  distinct(KO,.keep_all=TRUE)
+
+local_name <- original_mapping %>%
+  group_by(KO) %>%
+  summarise(Local_name=most_common(Function_from_annotation),.groups='drop')
+
+ko_names <- ko_protein %>% distinct(KO) %>%
+  left_join(ko_reference %>% select(KO,KO_map_name),by='KO') %>%
+  left_join(ko_cache,by='KO') %>%
+  left_join(local_name,by='KO') %>%
+  mutate(
+    KO_map_name=na_if(stringr::str_squish(KO_map_name),''),
+    KO_name=na_if(stringr::str_squish(KO_name),''),
+    Local_name=na_if(stringr::str_squish(Local_name),''),
+    KO_name_source=case_when(
+      !is.na(KO_map_name) ~ 'KO_map_file.xlsx',
+      !is.na(KO_name) ~ 'Old cached name',
+      !is.na(Local_name) ~ 'Original protein annotation',
+      TRUE ~ 'KO identifier'),
+    KO_display_name=coalesce(KO_map_name,KO_name,Local_name,KO),
+    # Workbook labels stay intact (including any [EC ...] in the Excel name).
+    KO_display_name=if_else(KO_name_source=='KO_map_file.xlsx',
+                            KO_display_name,clean_ko_name(KO_display_name))
+  )
+ko_protein <- ko_protein %>%
+  left_join(ko_names %>% select(KO,KO_display_name,KO_name_source),by='KO')
+
+message('KO figure label sources:')
+print(ko_names %>% count(KO_name_source,name='Number_of_KOs'),n=Inf)
+
+
+needed_lookup <- c('Dataset','Protein','KO','ProteinGroupID','Representative',
+                   'GroupSize','PeptideSet','OriginalObservedProfile','GroupOrganism')
+lookup <- readr::read_csv(lookup_file,
+                          col_types=readr::cols(.default=readr::col_character()),
+                          show_col_types=FALSE)
+missing_lookup <- setdiff(needed_lookup,names(lookup))
+if (length(missing_lookup)) stop('KO grouping lookup missing columns: ',
+                                 paste(missing_lookup,collapse=', '))
+lookup <- lookup %>%
+  mutate(across(all_of(c('Dataset','Protein','KO','ProteinGroupID')),
+                ~trimws(as.character(.x)))) %>%
+  filter(Dataset %in% expected, !is.na(KO),nzchar(KO)) %>%
+  distinct(Dataset,KO,Protein,.keep_all=TRUE)
+if(anyDuplicated(lookup[c('Dataset','KO','Protein')]))
+  stop('Duplicate dataset-KO-protein keys in group lookup.')
+if(anyNA(lookup$ProteinGroupID) || any(!nzchar(lookup$ProteinGroupID)))
+  stop('Blank group IDs in strict lookup.')
+
+# For every collapsed group, all three original-evidence conditions must hold.
+# Missing peptide lists should NEVER be part of a multiaccession group.
+lookup_qc <- lookup %>% group_by(Dataset,KO,ProteinGroupID) %>%
+  summarise(N_Accession=n_distinct(Protein),
+            N_Peptide_Sets=n_distinct(PeptideSet),
+            N_Original_8_Mouse_Profiles=n_distinct(OriginalObservedProfile),
+            Missing_Peptide=any(is.na(PeptideSet) | PeptideSet==''),
+            Missing_Raw_Profile=any(is.na(OriginalObservedProfile) |
+                                      OriginalObservedProfile==''),
+            .groups='drop')
+bad_lookup <- lookup_qc %>% filter(N_Accession>1L &
+                                     (N_Peptide_Sets!=1L | N_Original_8_Mouse_Profiles!=1L |
+                                        Missing_Peptide | Missing_Raw_Profile))
+if(nrow(bad_lookup)) {
+  readr::write_csv(bad_lookup,file.path(audit_dir,'ERROR_GroupEvidenceConflicts.csv'))
+  stop('Invalid multiaccession group: peptide or original TSV profiles differ. See audit.')
 }
 
-compute_ko_stats <- function(df_long) {
-  stats_tbl <- df_long %>%
-    group_by(KO, name, Pathway, Sex, Timepoint) %>%
-    group_modify(~{
-      dat <- .x %>%
-        filter(!is.na(log2_intensity), !is.na(Group)) %>%
-        filter(Group %in% c("Control", "Dosed"))
+# Accession-level stats from the ORIGINAL litter-aware run are retained.
+# No protein/KO/pathway mappings are added or changed.
+eligible <- ko_protein %>%
+  filter(KO %in% ko_reference$KO) %>%
+  distinct(Dataset,KO,Protein,.keep_all=TRUE)
+missing_evidence <- eligible %>%
+  anti_join(lookup,by=c('Dataset','KO','Protein'))
+if(nrow(missing_evidence)) {
+  readr::write_csv(missing_evidence %>%
+                     select(Dataset,KO,Protein),file.path(audit_dir,'ERROR_Missing_GroupEvidence.csv'))
+  stop(nrow(missing_evidence),' plotted KO/accessions lack the new strict group lookup. ',
+       'Check the selected-pathway script and its original annotation sources.')
+}
+
+ko_group_members <- eligible %>%
+  left_join(lookup %>%
+              select(Dataset,KO,Protein,ProteinGroupID,Representative,GroupSize,
+                     PeptideSet,OriginalObservedProfile,GroupOrganism),
+            by=c('Dataset','KO','Protein'),relationship='many-to-one')
+if(anyNA(ko_group_members$ProteinGroupID)) stop('Group join failed.')
+if(anyDuplicated(ko_group_members[c('Dataset','KO','Protein')]))
+  stop('Group join unexpectedly duplicated accession statistics.')
+
+max_diff <- function(z) {
+  if (!length(z) || any(!is.finite(z))) return(Inf)
+  max(z)-min(z)
+}
+finite_median <- function(z) {
+  z <- z[is.finite(z)]
+  if(length(z)) median(z) else NA_real_
+}
+
+
+plotted_group_ids <- ko_group_members %>%
+  distinct(Dataset,KO,ProteinGroupID)
+missing_limma_members <- lookup %>%
+  anti_join(limma_all %>% select(Dataset,Protein),by=c('Dataset','Protein')) %>%
+  mutate(Affects_Plotted_Group = paste(Dataset,KO,ProteinGroupID,sep='||') %in%
+           paste(plotted_group_ids$Dataset,plotted_group_ids$KO,
+                 plotted_group_ids$ProteinGroupID,sep='||'))
+readr::write_csv(missing_limma_members %>%
+                   select(Dataset,KO,ProteinGroupID,Protein,Affects_Plotted_Group),
+                 file.path(audit_dir,'QC_Lookup_Accessions_Missing_From_Limma.csv'))
+if(nrow(missing_limma_members)) {
+  message('Lookup accessions missing from original limma: ',
+          nrow(missing_limma_members),
+          '; affecting groups actually plotted: ',
+          sum(missing_limma_members$Affects_Plotted_Group),
+          '. See QC_Lookup_Accessions_Missing_From_Limma.csv')
+}
+
+all_group_members <- lookup %>%
+  left_join(limma_all %>% select(Dataset,Protein,logFC,P.Value,adj.P.Val),
+            by=c('Dataset','Protein'), relationship='many-to-one')
+
+# A grouped p-value is displayed ONLY if ALL the original accession-level
+# model results agree to numerical precision. We do NOT aggregate p-values.
+ko_group_stats <- all_group_members %>%
+  semi_join(plotted_group_ids,by=c('Dataset','KO','ProteinGroupID')) %>%
+  group_by(Dataset,KO,ProteinGroupID) %>%
+  summarise(
+    N_Members_In_Group=n_distinct(Protein),
+    Missing_or_Invalid_Limma_Statistics=sum(
+      !is.finite(logFC) | !is.finite(P.Value) | !is.finite(adj.P.Val)),
+    MemberAccessions=paste(sort(unique(Protein)),collapse='; '),
+    Representative=sort(unique(Protein))[1],
+    Max_logFC_difference=max_diff(logFC),
+    Max_P_difference=max_diff(P.Value),
+    Max_FDR_difference=max_diff(adj.P.Val),
+    Group_logFC_descriptive=finite_median(logFC),
+    GroupTaxon= {
+      t <- unique(GroupOrganism[!is.na(GroupOrganism) & nzchar(GroupOrganism)])
+      if(length(t)==1L && !t %in% c('Taxon unresolved','Unknown taxa','Unknown taxon'))
+        clean_taxon(t) else 'Unknown taxa'
+    },
+    .groups='drop'
+  ) %>%
+  mutate(
+    MemberStatisticsAgree=(Missing_or_Invalid_Limma_Statistics==0L &
+                             Max_logFC_difference<=1e-8 &
+                             Max_P_difference<=1e-8 &
+                             Max_FDR_difference<=1e-8),
+    NeedsReview=!MemberStatisticsAgree,
+    Statistical_Status=case_when(
+      Missing_or_Invalid_Limma_Statistics>0 ~
+        'Group member missing or invalid limma statistics; significance unresolved',
+      MemberStatisticsAgree ~ 'Existing accession-level limma results agree',
+      TRUE ~ 'Member limma statistics differ; group significance unresolved')
+  )
+
+
+ko_plot_source <- ko_group_members %>%
+  left_join(ko_group_stats %>%
+              select(Dataset,KO,ProteinGroupID,N_Members_In_Group,
+                     Group_logFC_descriptive,GroupTaxon,MemberStatisticsAgree,
+                     NeedsReview,Statistical_Status),
+            by=c('Dataset','KO','ProteinGroupID'),relationship='many-to-one') %>%
+  group_by(Dataset,KO,ProteinGroupID) %>%
+  arrange(Protein,.by_group=TRUE) %>%
+  slice(1L) %>% ungroup() %>%
+  mutate(
+    logFC=if_else(MemberStatisticsAgree,logFC,Group_logFC_descriptive),
+    P.Value=if_else(MemberStatisticsAgree,P.Value,NA_real_),
+    adj.P.Val=if_else(MemberStatisticsAgree,adj.P.Val,NA_real_),
+    Significant=is.finite(adj.P.Val) & adj.P.Val<fdr_cutoff &
+      is.finite(logFC) & abs(logFC)>=abs_logfc_cutoff,
+    Direction=case_when(
+      NeedsReview ~ 'Group statistics need review',
+      Significant & logFC>0 ~ 'Enriched in dosed',
+      Significant & logFC<0 ~ 'Depleted in dosed',
+      TRUE ~ 'N/S'),
+    Taxon_cleaned=GroupTaxon
+  )
+if(anyDuplicated(ko_plot_source[c('Dataset','KO','ProteinGroupID')]))
+  stop('Multiple plot rows remain per KO protein group.')
+stopifnot(nrow(ko_plot_source)==nrow(ko_group_stats),
+          nrow(ko_plot_source)<=nrow(eligible))
+
+# Exports preserve every accession and every unresolved case for auditing.
+readr::write_csv(lookup_qc,file.path(audit_dir,'Original_Evidence_Group_Check.csv'))
+readr::write_csv(ko_group_members %>%
+                   select(Dataset,KO,ProteinGroupID,Protein,Representative,GroupSize,
+                          PeptideSet,OriginalObservedProfile,GroupOrganism,
+                          logFC,P.Value,adj.P.Val,Significant,Sex,Timepoint),
+                 file.path(audit_dir,'KO_Plot_Eligible_Accessions.csv'))
+readr::write_csv(all_group_members %>%
+                   semi_join(plotted_group_ids,by=c('Dataset','KO','ProteinGroupID')),
+                 file.path(audit_dir,'All_Strict_Group_Members_With_Limma_Statistics.csv'))
+readr::write_csv(ko_group_stats,
+                 file.path(audit_dir,'All_KO_Group_Stats_Agreement.csv'))
+readr::write_csv(ko_group_stats %>% filter(NeedsReview),
+                 file.path(audit_dir,'REVIEW_Group_Missing_or_Differing_Limma_Stats.csv'))
+readr::write_csv(ko_plot_source,
+                 file.path(audit_dir,'One_Dot_Per_Protein_Group_Plot_Data.csv'))
+message('Strict original-evidence grouping: ',nrow(eligible),
+        ' accession/KO entries -> ',nrow(ko_plot_source),' group/KO dots; ',
+        sum(ko_group_stats$NeedsReview),' groups requiring statistical review.')
+
+ko_summary <- ko_plot_source %>%
+  group_by(KO,KO_display_name,Sex,Timepoint) %>%
+  summarise(n_groups=n_distinct(ProteinGroupID),
+            n_significant=sum(Significant,na.rm=TRUE),
+            n_enriched=sum(Significant & logFC>0,na.rm=TRUE),
+            n_depleted=sum(Significant & logFC<0,na.rm=TRUE),
+            n_review=sum(NeedsReview,na.rm=TRUE),
+            .groups='drop')
+readr::write_csv(ko_summary,file.path(audit_dir,'KO_Sex_Timepoint_Summary.csv'))
+
+
+
+compact_plot_width <- 4.0
+compact_plot_height <- 2.0
+min_plot_panel_width <- 3.0
+legend_title_size <- 6
+legend_text_size <- 5
+point_size_sig <- 1.8
+point_size_ns <- 1.4
+jitter_width <- 0.25   # current preferred spacing; adjust if desired
+# Nonsignificant points remain light gray; significant points show taxon color.
+show_timepoint_vlines <- TRUE
+vline_color <- 'grey35'
+vline_size <- 0.28
+
+# Create ONE stable palette from every displayed taxon in the whole analysis.
+# Taxa sharing a KO/sex plot are assigned perceptually separated colors.
+
+# ------------------------------------------------------------
+# TAXON COLORS: OKABE-ITO + DARK2 + SET1 + PAIRED
+# One reproducible color per taxon, optimized for taxa that
+# appear together as significant points in the same KO/sex plot.
+# ------------------------------------------------------------
+make_taxa_palette <- function(taxa_levels, plot_data) {
+  
+  taxa_levels <- sort(unique(as.character(taxa_levels)))
+  taxa_levels <- taxa_levels[!is.na(taxa_levels) & nzchar(taxa_levels)]
+  named_taxa <- setdiff(taxa_levels, 'Unknown taxa')
+  
+  # Strong, established qualitative colors; avoid the pale yellow.
+  okabe_ito <- c('#E69F00', '#56B4E9', '#009E73', '#0072B2',
+                 '#D55E00', '#CC79A7', '#000000')
+  dark2 <- c('#1B9E77', '#D95F02', '#7570B3', '#E7298A',
+             '#66A61E', '#E6AB02', '#A6761D')
+  set1 <- c('#E41A1C', '#377EB8', '#4DAF4A', '#984EA3',
+            '#FF7F00', '#A65628', '#F781BF')
+  paired <- c('#1F78B4', '#33A02C', '#E31A1C',
+              '#FF7F00', '#6A3D9A', '#B15928')
+  original_palette <- unique(c(okabe_ito, dark2, set1, paired))
+  
+  to_lab <- function(hex) {
+    grDevices::convertColor(
+      t(grDevices::col2rgb(hex)) / 255,
+      from = 'sRGB', to = 'Lab', scale.in = 1
+    )
+  }
+  
+  # Supply extra colors only when the original palette is not large enough.
+  candidates <- original_palette
+  if (length(named_taxa) > length(original_palette)) {
+    extras <- unique(grDevices::hcl.colors(
+      max(240L, length(named_taxa) * 5L), palette = 'Dynamic'
+    ))
+    extra_lab <- to_lab(extras)
+    extra_chroma <- sqrt(extra_lab[, 2]^2 + extra_lab[, 3]^2)
+    vivid <- extras[extra_lab[, 1] >= 35 & extra_lab[, 1] <= 75 &
+                      extra_chroma >= 38]
+    candidates <- unique(c(original_palette, vivid, extras))
+  }
+  candidates <- setdiff(candidates, c('#707070', '#BFC3C7'))
+  if (length(named_taxa) > length(candidates)) {
+    stop('Not enough unique colors for the number of taxa.')
+  }
+  
+  result <- stats::setNames(character(length(named_taxa)), named_taxa)
+  if (length(named_taxa)) {
+    # Only significant taxon points use taxon color. N/S stays gray.
+    active <- plot_data %>%
+      dplyr::filter(
+        is.finite(logFC),
+        dplyr::coalesce(Significant, FALSE) |
+          dplyr::coalesce(NeedsReview, FALSE),
+        Taxon_cleaned %in% named_taxa
+      ) %>%
+      dplyr::distinct(KO, Sex, Taxon_cleaned)
+    
+    # Build a list of taxa displayed together in each KO/sex plot.
+    groups <- split(active$Taxon_cleaned,
+                    paste(active$KO, active$Sex, sep = '||'))
+    neighbors <- stats::setNames(
+      rep(list(character()), length(named_taxa)), named_taxa
+    )
+    for (g in groups) {
+      g <- unique(g)
+      for (taxon in g) {
+        neighbors[[taxon]] <- union(neighbors[[taxon]],
+                                    setdiff(g, taxon))
+      }
+    }
+    
+    # Prioritize taxa that share figures with the most other taxa.
+    degree <- lengths(neighbors[named_taxa])
+    frequency <- vapply(named_taxa, function(taxon) {
+      sum(active$Taxon_cleaned == taxon)
+    }, integer(1))
+    assign_order <- named_taxa[order(-degree, -frequency, named_taxa)]
+    
+    # Calculate perceptual color distances once (CIELAB / Delta E 1976).
+    lab <- to_lab(candidates)
+    distances <- as.matrix(stats::dist(lab))
+    assigned <- stats::setNames(rep(NA_integer_, length(named_taxa)),
+                                named_taxa)
+    
+    for (taxon in assign_order) {
+      used <- unname(assigned[!is.na(assigned)])
+      available <- setdiff(seq_along(candidates), used)
       
-      n_control <- sum(dat$Group == "Control")
-      n_dosed   <- sum(dat$Group == "Dosed")
-      
-      if (n_control < 1 || n_dosed < 1) {
-        return(tibble(
-          n_control = n_control,
-          n_dosed = n_dosed,
-          p_value = NA_real_
-        ))
+      if (length(used)) {
+        distance_all <- apply(
+          distances[available, used, drop = FALSE], 1, min
+        )
+      } else {
+        distance_all <- rep(100, length(available))
       }
       
-      wt <- tryCatch(
-        wilcox.test(log2_intensity ~ Group, data = dat, exact = FALSE),
-        error = function(e) NULL
+      assigned_peers <- intersect(
+        neighbors[[taxon]], names(assigned)[!is.na(assigned)]
       )
+      if (length(assigned_peers)) {
+        peer_idx <- unname(assigned[assigned_peers])
+        distance_peers <- apply(
+          distances[available, peer_idx, drop = FALSE], 1, min
+        )
+      } else {
+        distance_peers <- distance_all
+      }
       
-      tibble(
-        n_control = n_control,
-        n_dosed = n_dosed,
-        p_value = if (is.null(wt)) NA_real_ else wt$p.value
+      # Maximize separation among taxa occurring in the SAME figure;
+      # also encourage separation overall and favor the original palettes.
+      original_bonus <- ifelse(available <= length(original_palette), 3, 0)
+      score <- distance_peers + 0.15 * distance_all + original_bonus
+      assigned[[taxon]] <- available[which.max(score)]
+    }
+    result <- stats::setNames(candidates[unname(assigned[named_taxa])],
+                              named_taxa)
+  }
+  
+  if ('Unknown taxa' %in% taxa_levels) {
+    result <- c(result, 'Unknown taxa' = '#707070')
+  }
+  if (anyDuplicated(unname(result))) {
+    stop('Taxon colors must be globally unique.')
+  }
+  result
+}
+
+# Standardize taxon names, including Unknown taxa, BEFORE creating the palette.
+ko_plot_source <- ko_plot_source %>%
+  mutate(Taxon_cleaned = clean_taxon(Taxon_cleaned))
+
+global_taxa <- ko_plot_source %>%
+  filter(is.finite(logFC), is.finite(adj.P.Val) | NeedsReview) %>%
+  distinct(Taxon_cleaned) %>%
+  pull(Taxon_cleaned)
+global_taxa_colors <- make_taxa_palette(global_taxa, ko_plot_source)
+
+# Export explicit color lookup to document taxon identity across all figures.
+taxon_color_manifest <- ko_plot_source %>%
+  filter(Taxon_cleaned %in% names(global_taxa_colors)) %>%
+  group_by(Taxon_cleaned) %>%
+  summarise(N_KOs=n_distinct(KO), N_Protein_Groups=n_distinct(paste(Dataset, KO, ProteinGroupID)),
+            .groups='drop') %>%
+  mutate(Color_Hex=unname(global_taxa_colors[Taxon_cleaned])) %>%
+  arrange(Taxon_cleaned)
+readr::write_csv(taxon_color_manifest, file.path(audit_dir, 'GLOBAL_Taxon_Color_Lookup.csv'))
+message('Global taxon palette: ',length(global_taxa_colors),
+        ' unique colors, optimized for taxa appearing together in each KO/sex plot.')
+
+plot_one_ko <- function(ko) {
+  name_value <- ko_reference$KO_map_name[match(ko,ko_reference$KO)]
+  if (!length(name_value) || is.na(name_value) || !nzchar(name_value)) {
+    hit <- ko_names$KO_display_name[match(ko,ko_names$KO)]
+    name_value <- if (length(hit) && !is.na(hit) && nzchar(hit)) hit else ko
+  }
+  
+  dat <- ko_plot_source %>% filter(KO == ko)
+  plot_dat <- dat %>%
+    filter(is.finite(logFC), is.finite(adj.P.Val) | NeedsReview) %>%
+    mutate(
+      Sex=as.character(Sex),
+      Timepoint=factor(as.character(Timepoint), levels=time_levels),
+      Taxon_cleaned=clean_taxon(Taxon_cleaned)
+    )
+  
+  # Significant taxa have globally consistent colors; N/S points are light gray.
+  # All reviewed groups retain their taxon color and use a cross marker.
+  taxa_this_ko <- sort(unique(plot_dat$Taxon_cleaned))
+  taxa_this_ko <- c(setdiff(taxa_this_ko, 'Unknown taxa'),
+                    intersect(taxa_this_ko, 'Unknown taxa'))
+  organism_colors <- global_taxa_colors[taxa_this_ko]
+  if (anyNA(organism_colors)) stop('Missing global taxon color for KO ', ko)
+  
+  # The two sexes share symmetric limits for the KO; safe for empty KO data.
+  y_max <- if(nrow(plot_dat)) {
+    max(1, ceiling(max(abs(plot_dat$logFC), na.rm=TRUE)))
+  } else 1
+  
+  # Use all original mapped GROUPS to distinguish missing data from N/S.
+  coverage <- tidyr::expand_grid(Sex=sex_levels,Timepoint=time_levels) %>%
+    left_join(dat %>%
+                mutate(Timepoint=as.character(Timepoint)) %>%
+                count(Sex,Timepoint,name='n_matched_groups'),
+              by=c('Sex','Timepoint')) %>%
+    left_join(plot_dat %>%
+                mutate(Timepoint=as.character(Timepoint)) %>%
+                count(Sex,Timepoint,name='n_plotted_groups'),
+              by=c('Sex','Timepoint')) %>%
+    mutate(
+      n_matched_groups=replace_na(n_matched_groups,0L),
+      n_plotted_groups=replace_na(n_plotted_groups,0L),
+      Status=case_when(
+        n_plotted_groups>0 ~ 'Plotted',
+        n_matched_groups>0 ~ 'No valid statistics',
+        TRUE ~ 'Not detected'
       )
-    }) %>%
-    ungroup()
-  
-  stats_tbl %>%
-    group_by(Pathway, Sex) %>%
-    mutate(
-      p_adj = p.adjust(p_value, method = "BH"),
-      sig_label = p_to_stars(p_adj)
-    ) %>%
-    ungroup()
-}
-
-# ============================================================
-# 3. READ KO MAP FILE
-# ============================================================
-
-ko_map <- read_xlsx(ko_map_file, sheet = "Sheet1") %>%
-  rename_with(~ str_trim(.x)) %>%
-  mutate(across(where(is.character), str_squish))
-
-required_ko_cols <- c("KO", "name", "Pathway")
-missing_ko_cols <- setdiff(required_ko_cols, colnames(ko_map))
-if (length(missing_ko_cols) > 0) {
-  stop("KO_map_file.xlsx is missing columns: ", paste(missing_ko_cols, collapse = ", "))
-}
-
-ko_map <- ko_map %>%
-  filter(!is.na(KO), KO != "") %>%
-  distinct(KO, .keep_all = TRUE)
-
-target_kos <- unique(ko_map$KO)
-
-# ============================================================
-# 4. READ PROTEIN -> KO MAPPING
-# ============================================================
-
-protein_ko_map <- read_csv(protein_ko_map_file, show_col_types = FALSE) %>%
-  mutate(
-    Protein = as.character(Protein),
-    KO = as.character(KO)
-  ) %>%
-  filter(!is.na(Protein), Protein != "", !is.na(KO), KO != "") %>%
-  filter(KO %in% target_kos) %>%
-  distinct(Protein, KO)
-
-if (nrow(protein_ko_map) == 0) {
-  stop("No proteins from Protein_KO_membership_all_sources.csv matched the KOs in KO_map_file.xlsx")
-}
-
-# ============================================================
-# 5. READ LIMMA FILES TO EXTRACT ORGANISM NAMES
-# ============================================================
-
-read_one_limma_file <- function(f) {
-  read_xlsx(f) %>%
-    mutate(
-      source_file = basename(f),
-      Timepoint = extract_timepoint_from_limma(basename(f)),
-      Sex = extract_sex_from_limma(basename(f))
-    ) %>%
-    select(any_of(c("Protein", "Function", "Timepoint", "Sex"))) %>%
-    mutate(
-      Protein = as.character(Protein),
-      Function = as.character(Function),
-      Organism = extract_organism(Function),
-      Organism = str_replace(Organism, "\\s+DSM\\s+\\d+$", ""),
-      Organism = ifelse(is.na(Organism) | Organism == "", "Unknown organism", Organism)
-    ) %>%
-    distinct(Protein, Timepoint, Sex, Organism, .keep_all = TRUE)
-}
-
-organism_lookup <- map_dfr(limma_files, read_one_limma_file) %>%
-  distinct(Protein, Timepoint, Sex, Organism)
-
-organism_lookup_global <- organism_lookup %>%
-  distinct(Protein, Organism) %>%
-  group_by(Protein) %>%
-  summarise(
-    Organism = first(Organism[!is.na(Organism)]),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    Organism = ifelse(is.na(Organism) | Organism == "", "Unknown organism", Organism)
-  )
-
-# ============================================================
-# 6. READ expr_imp FILES
-# ============================================================
-
-read_one_expr_file <- function(f) {
-  df <- read_xlsx(f)
-  sample_cols <- grep("^(Control|Dosed)_", colnames(df), value = TRUE)
-  
-  if (!("Protein" %in% colnames(df))) {
-    stop("File is missing Protein column: ", f)
-  }
-  if (length(sample_cols) == 0) {
-    stop("No sample columns like Control_* or Dosed_* found in: ", f)
-  }
-  
-  df %>%
-    mutate(
-      Protein = as.character(Protein),
-      Timepoint = extract_timepoint_from_expr(basename(f)),
-      Sex = extract_sex_from_expr(basename(f)),
-      source_file = basename(f)
-    ) %>%
-    pivot_longer(
-      cols = all_of(sample_cols),
-      names_to = "Sample",
-      values_to = "log2_intensity"
-    ) %>%
-    mutate(
-      log2_intensity = as.numeric(log2_intensity),
-      Group = case_when(
-        str_detect(Sample, "^Control_") ~ "Control",
-        str_detect(Sample, "^Dosed_")   ~ "Dosed",
-        TRUE ~ NA_character_
-      ),
-      Sample_ID = paste(Timepoint, Sex, Sample, sep = "_")
-    )
-}
-
-expr_long <- map_dfr(expr_files, read_one_expr_file)
-
-# ============================================================
-# 7. CALCULATE TOTAL MEASURED PROTEOME PER SAMPLE
-#    BEFORE RESTRICTING TO SELECTED KOs
-# ============================================================
-
-# IMPORTANT:
-# The denominator is calculated from expr_long, which contains ALL proteins
-# in each expr_imp file. Therefore, total_proteome_linear is NOT restricted
-# to proteins present in KO_map_file.xlsx or protein_ko_map_file.
-#
-# For each biological sample:
-#   total_proteome_linear = sum(2^log2_intensity) across ALL measured proteins
-
-sample_total_proteome <- expr_long %>%
-  mutate(
-    linear_abundance = 2^log2_intensity
-  ) %>%
-  group_by(
-    Sex, Timepoint, Sample, Sample_ID, Group
-  ) %>%
-  summarise(
-    total_proteome_linear = sum(linear_abundance, na.rm = TRUE),
-    n_proteins_total = n_distinct(Protein[!is.na(log2_intensity)]),
-    .groups = "drop"
-  )
-
-# Safety check: each sample should have a finite, positive proteome denominator.
-bad_denominators <- sample_total_proteome %>%
-  filter(!is.finite(total_proteome_linear) | total_proteome_linear <= 0)
-
-if (nrow(bad_denominators) > 0) {
-  warning(
-    nrow(bad_denominators),
-    " sample(s) have non-finite or non-positive total proteome abundance. " ,
-    "Their relative KO abundance will be set to NA."
-  )
-}
-
-
-# ============================================================
-# 8. JOIN EXPRESSION TO KO MAP + ORGANISM
-# ============================================================
-
-# Only now do we restrict the numerator to proteins assigned to selected KOs.
-# The total-proteome denominator was already calculated using ALL proteins.
-
-expr_ko <- expr_long %>%
-  inner_join(protein_ko_map, by = "Protein") %>%
-  left_join(ko_map, by = "KO") %>%
-  left_join(organism_lookup, by = c("Protein", "Timepoint", "Sex")) %>%
-  left_join(
-    organism_lookup_global %>% rename(Organism_global = Organism),
-    by = "Protein"
-  ) %>%
-  mutate(
-    Organism = coalesce(Organism, Organism_global, "Unknown organism"),
-    Organism = ifelse(
-      is.na(Organism) | Organism == "",
-      "Unknown organism",
-      Organism
-    ),
-    linear_abundance = 2^log2_intensity
-  ) %>%
-  left_join(
-    sample_total_proteome,
-    by = c("Sex", "Timepoint", "Sample", "Sample_ID", "Group")
-  ) %>%
-  select(
-    Protein, KO, name, Pathway, Timepoint, Sex, Sample, Sample_ID, Group,
-    Organism, log2_intensity, linear_abundance,
-    total_proteome_linear, n_proteins_total
-  )
-
-if (nrow(expr_ko) == 0) {
-  stop("After joining expression data to protein-KO mapping, no rows remained.")
-}
-
-
-# ============================================================
-# 9. SUM WITHIN EACH SAMPLE: KO x SAMPLE x ORGANISM
-# ============================================================
-
-ko_org_sample <- expr_ko %>%
-  group_by(
-    KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group,
-    Organism, total_proteome_linear
-  ) %>%
-  summarise(
-    ko_org_linear = sum(linear_abundance, na.rm = TRUE),
-    n_proteins = n_distinct(Protein),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    relative_ko_abundance_taxon = ifelse(
-      is.finite(total_proteome_linear) & total_proteome_linear > 0,
-      ko_org_linear / total_proteome_linear,
-      NA_real_
-    )
-  )
-
-# Total abundance of each KO within each biological sample.
-ko_sample_total <- ko_org_sample %>%
-  group_by(
-    KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group,
-    total_proteome_linear
-  ) %>%
-  summarise(
-    ko_linear_total = sum(ko_org_linear, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    relative_ko_abundance = ifelse(
-      is.finite(total_proteome_linear) & total_proteome_linear > 0,
-      ko_linear_total / total_proteome_linear,
-      NA_real_
-    )
-  )
-
-
-# ============================================================
-# 10. TAXA COLLAPSE + GROUP SUMMARY FOR STACKED BARS
-# ============================================================
-
-# Keep the top taxa per KO x Sex based on summed linear KO abundance.
-top_taxa_by_ko_sex <- ko_org_sample %>%
-  group_by(KO, Sex, Organism) %>%
-  summarise(
-    total_abundance = sum(ko_org_linear, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  group_by(KO, Sex) %>%
-  arrange(desc(total_abundance), .by_group = TRUE) %>%
-  mutate(
-    rank_taxa = row_number(),
-    Organism_collapsed = ifelse(
-      rank_taxa <= top_n_taxa,
-      Organism,
-      "Other"
-    )
-  ) %>%
-  ungroup() %>%
-  select(KO, Sex, Organism, Organism_collapsed)
-
-ko_org_sample_collapsed <- ko_org_sample %>%
-  left_join(
-    top_taxa_by_ko_sex,
-    by = c("KO", "Sex", "Organism")
-  ) %>%
-  mutate(
-    Organism_collapsed = coalesce(Organism_collapsed, "Other")
-  ) %>%
-  group_by(
-    KO, name, Pathway, Sex, Timepoint, Sample, Sample_ID, Group,
-    total_proteome_linear,
-    Organism = Organism_collapsed
-  ) %>%
-  summarise(
-    ko_org_linear = sum(ko_org_linear, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    relative_ko_abundance_taxon = ifelse(
-      is.finite(total_proteome_linear) & total_proteome_linear > 0,
-      ko_org_linear / total_proteome_linear,
-      NA_real_
-    )
-  )
-
-# ------------------------------------------------------------
-# Group-level taxonomic contributions
-# ------------------------------------------------------------
-# Each taxon segment is first normalized within each biological sample,
-# then averaged across biological samples in that Timepoint x Group.
-
-ko_org_group_summary <- ko_org_sample_collapsed %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Group, Organism) %>%
-  summarise(
-    mean_linear = mean(ko_org_linear, na.rm = TRUE),
-    median_linear = median(ko_org_linear, na.rm = TRUE),
-    mean_relative_taxon = mean(relative_ko_abundance_taxon, na.rm = TRUE),
-    median_relative_taxon = median(relative_ko_abundance_taxon, na.rm = TRUE),
-    n_samples = n_distinct(Sample_ID),
-    .groups = "drop"
-  )
-
-# ------------------------------------------------------------
-# Group-level total KO relative abundance
-# ------------------------------------------------------------
-# This is explicitly the mean of the SAMPLE-LEVEL normalized KO values.
-
-ko_group_total <- ko_sample_total %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
-  summarise(
-    relative_ko_abundance = mean(relative_ko_abundance, na.rm = TRUE),
-    median_relative_ko_abundance = median(relative_ko_abundance, na.rm = TRUE),
-    mean_ko_linear = mean(ko_linear_total, na.rm = TRUE),
-    n_samples_total = n_distinct(Sample_ID),
-    .groups = "drop"
-  )
-
-# ------------------------------------------------------------
-# Join bar height back to taxonomic contributions
-# ------------------------------------------------------------
-# Taxa fractions are calculated from the mean sample-level relative
-# contributions, and plot_height is scaled so all taxon segments sum
-# exactly to the mean sample-level relative KO abundance for that bar.
-
-ko_org_group_summary <- ko_org_group_summary %>%
-  left_join(
-    ko_group_total,
-    by = c("KO", "name", "Pathway", "Sex", "Timepoint", "Group")
-  ) %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
-  mutate(
-    total_mean_relative_taxon = sum(mean_relative_taxon, na.rm = TRUE),
-    taxa_fraction = ifelse(
-      total_mean_relative_taxon > 0,
-      mean_relative_taxon / total_mean_relative_taxon,
-      0
-    ),
-    plot_height = taxa_fraction * relative_ko_abundance
-  ) %>%
-  ungroup()
-
-# ------------------------------------------------------------
-# INTERNAL SCALING CHECK
-# ------------------------------------------------------------
-# For every KO x Sex x Timepoint x Group:
-#   sum(plot_height across taxa)
-# must equal
-#   mean sample-level relative KO abundance
-# apart from floating-point rounding.
-
-ko_relative_scaling_check <- ko_org_group_summary %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
-  summarise(
-    stacked_bar_height = sum(plot_height, na.rm = TRUE),
-    expected_relative_ko_abundance = first(relative_ko_abundance),
-    difference = stacked_bar_height - expected_relative_ko_abundance,
-    .groups = "drop"
-  )
-
-# ============================================================
-# 11. PANEL-LEVEL STATS
-# ============================================================
-
-panel_stats <- compute_ko_stats(expr_ko)
-
-# ============================================================
-# ============================================================
-# 12. SUPPLEMENTARY INFORMATION TABLES
-# ============================================================
-
-ko_protein_table <- expr_ko %>%
-  distinct(KO, name, Pathway, Protein, Organism) %>%
-  arrange(Pathway, KO, Organism, Protein)
-
-ko_taxa_contributor_rank <- ko_org_group_summary %>%
-  group_by(KO, name, Pathway, Sex, Timepoint, Group) %>%
-  arrange(desc(taxa_fraction), .by_group = TRUE) %>%
-  mutate(
-    contributor_rank = row_number(),
-    percent_contribution = taxa_fraction * 100
-  ) %>%
-  ungroup() %>%
-  select(
-    KO, name, Pathway, Sex, Timepoint, Group,
-    contributor_rank,
-    Organism,
-    mean_linear,
-    median_linear,
-    mean_relative_taxon,
-    median_relative_taxon,
-    relative_ko_abundance,
-    median_relative_ko_abundance,
-    mean_ko_linear,
-    taxa_fraction,
-    percent_contribution,
-    plot_height,
-    n_samples
-  )
-
-ko_coverage <- expr_ko %>%
-  group_by(KO, name, Pathway, Sex, Timepoint) %>%
-  summarise(
-    n_proteins = n_distinct(Protein),
-    n_organisms = n_distinct(Organism),
-    n_samples = n_distinct(Sample_ID),
-    .groups = "drop"
-  ) %>%
-  arrange(Pathway, KO, Sex, Timepoint)
-
-analysis_parameters <- tibble(
-  Parameter = c(
-    "Input expression files",
-    "Input KO map",
-    "Protein-KO mapping file",
-    "Abundance scale",
-    "Linear abundance calculation",
-    "Proteome denominator",
-    "Stacked bar y-axis",
-    "Normalization scope",
-    "Cross-sex interpretation",
-    "Taxa collapse rule",
-    "Statistical test",
-    "Comparison",
-    "Multiple testing correction",
-    "FDR grouping",
-    "Significance labels"
-  ),
-  Value = c(
-    paste(expr_files, collapse = "; "),
-    ko_map_file,
-    protein_ko_map_file,
-    "Protein-level log2 intensity from expr_imp files",
-    "linear_abundance = 2^log2_intensity",
-    "All measured proteins in each expr_imp sample, calculated before KO filtering",
-    "Relative KO abundance",
-    "Each biological sample is normalized independently: summed linear abundance of proteins assigned to the KO divided by summed linear abundance of ALL measured proteins in that same sample; group means are calculated after sample-level normalization",
-    "Relative KO abundance is directly comparable across experimental conditions because every sample is normalized to its own total measured proteome; interpretation across sexes still depends on comparable proteomic acquisition and preprocessing",
-    paste0("Top ", top_n_taxa, " taxa per KO x Sex retained; remaining taxa collapsed as Other"),
-    "Wilcoxon rank-sum test",
-    "Control vs Dosed within each KO x Sex x Timepoint",
-    "Benjamini-Hochberg",
-    "Adjusted within Pathway x Sex",
-    "ns, *, **, ***, **** based on BH-adjusted p-value"
-  )
-)
-
-write_csv(
-  ko_protein_table,
-  file.path(out_dir, "tables", "selected_KO_contributing_proteins.csv")
-)
-
-write_csv(
-  sample_total_proteome,
-  file.path(out_dir, "tables", "sample_total_measured_proteome.csv")
-)
-
-write_csv(
-  ko_org_sample_collapsed,
-  file.path(out_dir, "tables", "selected_KO_taxa_linear_abundance_per_sample.csv")
-)
-
-write_csv(
-  ko_org_group_summary,
-  file.path(out_dir, "tables", "selected_KO_taxa_group_mean_relative_abundance.csv")
-)
-
-write_csv(
-  ko_relative_scaling_check,
-  file.path(out_dir, "tables", "selected_KO_relative_scaling_check.csv")
-)
-
-write_csv(
-  ko_sample_total,
-  file.path(out_dir, "tables", "selected_KO_total_linear_abundance_per_sample.csv")
-)
-
-write_csv(
-  panel_stats,
-  file.path(out_dir, "tables", "selected_KO_panel_stats.csv")
-)
-
-write_csv(
-  ko_taxa_contributor_rank,
-  file.path(out_dir, "tables", "selected_KO_taxa_contributor_rank_percent.csv")
-)
-
-write_csv(
-  ko_coverage,
-  file.path(out_dir, "tables", "selected_KO_coverage_summary.csv")
-)
-
-write_csv(
-  analysis_parameters,
-  file.path(out_dir, "tables", "selected_KO_analysis_parameters.csv")
-)
-
-write_xlsx(
-  list(
-    README_analysis_parameters = analysis_parameters,
-    KO_map = ko_map,
-    Protein_KO_mapping_used = protein_ko_map,
-    KO_contributing_proteins = ko_protein_table,
-    Sample_total_proteome = sample_total_proteome,
-    KO_total_linear_per_sample = ko_sample_total,
-    KO_taxa_linear_per_sample = ko_org_sample_collapsed,
-    KO_taxa_group_mean_relative = ko_org_group_summary,
-    KO_relative_scaling_check = ko_relative_scaling_check,
-    KO_taxa_contributor_rank = ko_taxa_contributor_rank,
-    KO_panel_stats = panel_stats,
-    KO_coverage_summary = ko_coverage
-  ),
-  file.path(out_dir, "tables", "selected_KO_Supplementary_Information.xlsx")
-)
-# ============================================================
-# 13. GLOBAL TAXA PALETTE
-# ============================================================
-
-all_taxa_levels <- ko_org_group_summary %>%
-  group_by(Organism) %>%
-  summarise(total_abundance = sum(mean_relative_taxon, na.rm = TRUE), .groups = "drop") %>%
-  arrange(desc(total_abundance)) %>%
-  pull(Organism)
-
-taxa_palette <- make_taxa_palette(all_taxa_levels)
-
-write_csv(
-  tibble(Organism = names(taxa_palette), Color = unname(taxa_palette)),
-  file.path(out_dir, "tables", "taxa_color_key.csv")
-)
-
-# ============================================================
-# ============================================================
-# ============================================================
-# 14. PLOT FUNCTION
-# Generates a plot even when the KO is completely absent
-# from the selected sex
-# ============================================================
-
-plot_one_ko_sex <- function(target_ko, target_sex,
-                            df_plot,
-                            df_stats,
-                            out_dir_tiff,
-                            out_dir_png,
-                            out_dir_pdf) {
-  
-  timepoint_levels <- c("5W", "8W", "12W")
-  group_levels <- c("Control", "Dosed")
-  
-  # ----------------------------------------------------------
-  # Obtain KO metadata from the original KO map.
-  # This allows the title to be generated even when the KO
-  # is completely absent from the selected sex.
-  # ----------------------------------------------------------
-  
-  ko_metadata <- ko_map %>%
-    filter(KO == target_ko) %>%
-    slice(1)
-  
-  if (nrow(ko_metadata) == 0) {
-    warning("No KO metadata found for: ", target_ko)
-    return(NULL)
-  }
-  
-  ko_name <- ko_metadata$name[1]
-  ko_pathway <- ko_metadata$Pathway[1]
-  
-  # ----------------------------------------------------------
-  # Select abundance data for this KO and sex
-  # ----------------------------------------------------------
-  
-  one <- df_plot %>%
-    filter(KO == target_ko, Sex == target_sex) %>%
-    mutate(
-      Timepoint = factor(Timepoint, levels = timepoint_levels),
-      Group = factor(Group, levels = group_levels)
     )
   
-  # ----------------------------------------------------------
-  # Select statistical results
-  # ----------------------------------------------------------
-  
-  one_stats <- df_stats %>%
-    filter(KO == target_ko, Sex == target_sex) %>%
-    mutate(
-      Timepoint = factor(Timepoint, levels = timepoint_levels)
-    )
-  
-  plot_title <- paste0(ko_name, " (", target_ko, ")")
-  
-  microbiome_label <- case_when(
-    target_sex == "Males"   ~ "Male Colon Microbiome",
-    target_sex == "Females" ~ "Female Colon Microbiome",
-    TRUE                    ~ target_sex
-  )
-  
-  plot_subtitle <- microbiome_label
-  
-  # ----------------------------------------------------------
-  # Determine which timepoints contain detectable abundance
-  # ----------------------------------------------------------
-  
-  detected_timepoints <- one %>%
-    filter(
-      !is.na(relative_ko_abundance),
-      relative_ko_abundance > 0
-    ) %>%
-    distinct(Timepoint) %>%
-    pull(Timepoint) %>%
-    as.character()
-  
-  missing_timepoints <- setdiff(
-    timepoint_levels,
-    detected_timepoints
-  )
-  
-  # Labels for missing panels
-  missing_labels <- tibble(
-    Timepoint = factor(
-      missing_timepoints,
-      levels = timepoint_levels
-    ),
-    Group = factor(
-      rep("Control", length(missing_timepoints)),
-      levels = group_levels
-    ),
-    x = 1.5,
-    y = 0,
-    label = "Not detected"
-  )
-  
-  # ----------------------------------------------------------
-  # Determine maximum relative abundance in each panel
-  # ----------------------------------------------------------
-  
-  if (nrow(one) > 0) {
-    
-    panel_max <- one %>%
-      distinct(Timepoint, Group, relative_ko_abundance) %>%
-      group_by(Timepoint) %>%
-      summarise(
-        ymax = ifelse(
-          all(is.na(relative_ko_abundance)),
-          0,
-          max(relative_ko_abundance, na.rm = TRUE)
-        ),
-        .groups = "drop"
-      ) %>%
-      complete(
-        Timepoint = factor(
-          timepoint_levels,
-          levels = timepoint_levels
-        ),
-        fill = list(ymax = 0)
+  make_sex <- function(sex_name) {
+    sex_dat <- plot_dat %>% filter(Sex == sex_name)
+    missing_labels <- coverage %>%
+      filter(Sex == sex_name, Status != 'Plotted') %>%
+      mutate(Timepoint=factor(Timepoint, levels=time_levels),
+             y=0.55*y_max, label=Status)
+    sex_legend_keys <- taxa_this_ko[
+      taxa_this_ko %in% unique(
+        sex_dat$Taxon_cleaned[sex_dat$Significant | sex_dat$NeedsReview]
       )
+    ]
     
-  } else {
+    # Include N/S whenever nonsignificant points are plotted
+    if (any(!sex_dat$Significant & !sex_dat$NeedsReview)) {
+      sex_legend_keys <- c(sex_legend_keys, "N/S")
+    }
     
-    # Completely absent KO: create three empty panel records
-    panel_max <- tibble(
-      Timepoint = factor(
-        timepoint_levels,
-        levels = timepoint_levels
-      ),
-      ymax = 0
-    )
+    # Dynamic page size for long real taxa labels; NO empty legend categories.
+    max_chars <- if(length(sex_legend_keys)) {
+      max(nchar(sex_legend_keys, type='width'))
+    } else 0
+    legend_inches <- max_chars * legend_text_size * 0.57 / 72
+    fig_width <- if (length(sex_legend_keys)) {
+      max(compact_plot_width,min_plot_panel_width+0.38+legend_inches)
+    } else compact_plot_width
+    fig_height <- if (length(sex_legend_keys)) {
+      max(compact_plot_height,0.86+length(sex_legend_keys)*0.17)
+    } else compact_plot_height
+    fig_width <- ceiling(fig_width*20)/20
+    fig_height <- ceiling(fig_height*20)/20
+    
+    p <- ggplot(sex_dat, aes(x=Timepoint,y=logFC)) +
+      {if (show_timepoint_vlines)
+        geom_vline(xintercept=c(1.5,2.5),color=vline_color,
+                   linewidth=vline_size)
+        else NULL} +
+      geom_hline(yintercept=0,color='#292929',linewidth=0.55) +
+      geom_point(data=filter(sex_dat,!Significant & !NeedsReview),
+                 aes(color="N/S"),
+                 size=point_size_ns,shape=16,alpha=0.75,
+                 position=position_jitter(width=jitter_width,height=0,seed=42),
+                 show.legend=TRUE) +
+      geom_point(data=filter(sex_dat,NeedsReview),
+                 aes(color=Taxon_cleaned),
+                 size=point_size_sig,shape=4,stroke=0.75,alpha=0.96,
+                 position=position_jitter(width=jitter_width,height=0,seed=42),
+                 show.legend=TRUE) +
+      geom_point(data=filter(sex_dat,Significant),
+                 aes(color=Taxon_cleaned),
+                 size=point_size_sig,shape=16,alpha=0.98,
+                 position=position_jitter(width=jitter_width,height=0,seed=42),
+                 show.legend=TRUE) +
+      geom_text(data=missing_labels,
+                aes(x=Timepoint,y=y,label=label),
+                inherit.aes=FALSE,
+                color='black',
+                fontface='bold',
+                size=2.3) +
+      scale_x_discrete(limits=time_levels,drop=FALSE,
+                       expand=expansion(add=0.32)) +
+      scale_y_continuous(breaks=pretty(c(-y_max,y_max),n=3),
+                         expand=expansion(mult=c(0.04,0.04))) +
+      coord_cartesian(ylim=c(-y_max,y_max)) +
+      scale_color_manual(
+        name = 'Taxa / status',
+        values = c(global_taxa_colors, 'N/S' = '#BFC3C7'),
+        limits = sex_legend_keys,
+        breaks = sex_legend_keys,
+        drop = FALSE,
+        na.translate = FALSE
+      ) +
+      labs(title=paste0(ko,' | ',name_value,' | ',sex_name),
+           x=NULL,y='log2FC (Dosed - Control)',
+           caption=NULL) +
+      theme_bw(base_size=9) +
+      theme(
+        plot.title=element_text(face='bold',size=7.2,margin=margin(b=2)),
+        axis.text.x=element_text(size=8.2,color='black',face='bold'),
+        axis.text.y=element_text(size=6.5,color='black'),
+        axis.title.y=element_text(size=5.8,face='bold',margin=margin(r=2)),
+        panel.grid.major.x=element_blank(),
+        panel.grid.major.y=element_line(color='grey93',linewidth=0.25),
+        panel.grid.minor=element_blank(),
+        panel.border=element_rect(color='grey58',fill=NA,linewidth=0.35),
+        legend.position=if(length(sex_legend_keys)) 'right' else 'none',
+        legend.justification='center',
+        legend.title=element_text(size=legend_title_size,face='bold'),
+        legend.text=element_text(size=legend_text_size,face='bold'),
+        plot.caption=element_text(size=5.5,color='grey35',hjust=0),
+        legend.key.height=grid::unit(0.18,'cm'),
+        legend.key.width=grid::unit(0.20,'cm'),
+        legend.spacing.y=grid::unit(0,'cm'),
+        legend.box.spacing=grid::unit(0.03,'cm'),
+        legend.margin=margin(0,0,0,0),
+        plot.margin=margin(4,4,3,4)
+      ) +
+      guides(color=guide_legend(ncol=1L,byrow=TRUE,
+                                override.aes=list(shape=16,size=2.3,alpha=1,stroke=0)))
+    
+    stem <- paste0(clean_file(ko),'_',clean_file(name_value),'_',
+                   clean_file(sex_name),'_litter_blocked.tiff')
+    fp <- file.path(out_dir,stem)
+    ggplot2::ggsave(fp,plot=p,width=fig_width,height=fig_height,
+                    units='in',dpi=plot_dpi,device='tiff',
+                    compression='lzw',bg='white',limitsize=FALSE)
+    message('Saved: ',basename(fp),' | ',nrow(sex_dat),' dots; ',
+            sum(missing_labels$Status=='Not detected'),' ND timepoints; ',
+            sum(missing_labels$Status=='No valid statistics'),' untestable')
+    invisible(fp)
   }
-  
-  # ----------------------------------------------------------
-  # Add statistical annotation only to detected panels
-  # ----------------------------------------------------------
-  
-  one_stats <- one_stats %>%
-    left_join(panel_max, by = "Timepoint") %>%
-    filter(
-      !is.na(ymax),
-      ymax > 0,
-      !is.na(p_value)
-    ) %>%
-    mutate(
-      bracket_y = ymax * 1.10,
-      bracket_y_low = ymax * 1.05,
-      label_y = ymax * 1.23,
-      x_start = 1,
-      x_end = 2,
-      label_x = 1.5,
-      stat_text = sig_label
-    )
-  
-  # ----------------------------------------------------------
-
-  # Set a suitable KO-specific y-axis
-  # ----------------------------------------------------------
-  
-  abundance_values <- one$relative_ko_abundance
-  abundance_values <- abundance_values[
-    is.finite(abundance_values)
-  ]
-  
-  stat_values <- one_stats$label_y
-  stat_values <- stat_values[
-    is.finite(stat_values)
-  ]
-  
-  y_top <- max(
-    c(abundance_values, stat_values),
-    na.rm = TRUE
-  )
-  
-  # Add ~10% headroom above the highest bar/annotation
-  if (!is.finite(y_top) || y_top <= 0) {
-    y_top <- 0.10
-  } else {
-    y_top <- y_top * 1.10
-  }
-
-  # Place "Not detected" labels inside the actual y-axis range.
-  missing_labels <- missing_labels %>%
-    mutate(y = y_top * 0.45)
-  
-  # ----------------------------------------------------------
-  # Construct plot
-  # ----------------------------------------------------------
-  
-  p <- ggplot(
-    one,
-    aes(
-      x = Group,
-      y = plot_height,
-      fill = Organism
-    )
-  ) +
-    
-    geom_col(
-      width = 0.78,
-      color = "black",
-      linewidth = 0.2
-    ) +
-    
-    geom_segment(
-      data = one_stats,
-      aes(
-        x = x_start,
-        xend = x_end,
-        y = bracket_y,
-        yend = bracket_y
-      ),
-      inherit.aes = FALSE,
-      linewidth = 0.5
-    ) +
-    
-    geom_segment(
-      data = one_stats,
-      aes(
-        x = x_start,
-        xend = x_start,
-        y = bracket_y_low,
-        yend = bracket_y
-      ),
-      inherit.aes = FALSE,
-      linewidth = 0.5
-    ) +
-    
-    geom_segment(
-      data = one_stats,
-      aes(
-        x = x_end,
-        xend = x_end,
-        y = bracket_y_low,
-        yend = bracket_y
-      ),
-      inherit.aes = FALSE,
-      linewidth = 0.5
-    ) +
-    
-    geom_text(
-      data = one_stats,
-      aes(
-        x = label_x,
-        y = label_y,
-        label = stat_text
-      ),
-      inherit.aes = FALSE,
-      size = 5,
-      fontface = "bold"
-    ) +
-    
-    geom_text(
-      data = missing_labels,
-      aes(
-        x = x,
-        y = y,
-        label = label
-      ),
-      inherit.aes = FALSE,
-      size = 4,
-      fontface = "bold.italic",
-      color = "grey35"
-    ) +
-    
-    facet_wrap(
-      ~Timepoint,
-      nrow = 1,
-      scales = "fixed",
-      drop = FALSE
-    ) +
-    
-    scale_x_discrete(
-      limits = group_levels,
-      drop = FALSE
-    ) +
-    
-    scale_fill_manual(
-      values = taxa_palette,
-      drop = FALSE
-    ) +
-    
-    scale_y_continuous(
-      limits = c(0, y_top),
-      breaks = scales::pretty_breaks(n = 5),
-      labels = scales::label_percent(
-        accuracy = 0.001
-      ),
-      expand = expansion(mult = c(0.02, 0.04))
-    ) +
-    
-    labs(
-      title = plot_title,
-      subtitle = plot_subtitle,
-      x = NULL,
-      y = "Relative KO abundance (%)",
-      fill = "Taxa"
-    ) +
-    
-    theme_bw(base_size = 12) +
-    
-    theme(
-      plot.title = element_text(
-        face = "bold",
-        size = 17
-      ),
-      plot.subtitle = element_text(
-        face = "bold",
-        size = 12
-      ),
-      strip.text = element_text(
-        face = "bold",
-        size = 12
-      ),
-      strip.background = element_rect(
-        fill = "grey85",
-        color = "grey50",
-        linewidth = 0.6
-      ), 
-      axis.text.x = element_text(
-        face = "bold",
-        size = 10
-      ),
-      axis.text.y = element_text(
-        size = 9
-      ),
-      panel.grid.major.x = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.grid.major.y = element_line(
-        color = "grey88",
-        linewidth = 0.35
-      ),
-      legend.position = if (nrow(one) > 0) "right" else "none",
-      legend.title = element_text(
-        face = "bold",
-        size = 14
-      ),
-      legend.text = element_text(
-        face = "bold",
-        size = 13
-      ),
-      plot.margin = margin(12, 12, 12, 12)
-    )
-  
-  # ----------------------------------------------------------
-  # Save plot
-  # ----------------------------------------------------------
-  
-  file_stub <- paste(
-    clean_filename(ko_name),
-    clean_filename(target_ko),
-    clean_filename(target_sex),
-    "stacked_taxa_relative_proteome",
-    sep = "_"
-  )
-  
-  ggsave(
-    file.path(
-      out_dir_tiff,
-      paste0(file_stub, ".tiff")
-    ),
-    p,
-    width = plot_width,
-    height = plot_height,
-    dpi = plot_dpi,
-    compression = "lzw"
-  )
-  
-  ggsave(
-    file.path(
-      out_dir_png,
-      paste0(file_stub, ".png")
-    ),
-    p,
-    width = plot_width,
-    height = plot_height,
-    dpi = 300
-  )
-  
-  ggsave(
-    file.path(
-      out_dir_pdf,
-      paste0(file_stub, ".pdf")
-    ),
-    p,
-    width = plot_width,
-    height = plot_height
-  )
-  
-  return(p)
-}
-# 15. GENERATE ALL PLOTS
-# ============================================================
-
-plot_keys <- expand.grid(
-  KO = unique(ko_map$KO),
-  Sex = c("Males", "Females"),
-  stringsAsFactors = FALSE
-) %>%
-  as_tibble() %>%
-  left_join(ko_map %>% select(KO, name, Pathway), by = "KO") %>%
-  distinct(KO, name, Pathway, Sex)
-
-plot_list <- vector("list", nrow(plot_keys))
-names(plot_list) <- paste(plot_keys$KO, plot_keys$Sex, sep = " | ")
-
-for (i in seq_len(nrow(plot_keys))) {
-  this_ko <- plot_keys$KO[i]
-  this_sex <- plot_keys$Sex[i]
-  
-  plot_list[[i]] <- plot_one_ko_sex(
-    target_ko = this_ko,
-    target_sex = this_sex,
-    df_plot = ko_org_group_summary,
-    df_stats = panel_stats,
-    out_dir_tiff = file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "tiff"),
-    out_dir_png  = file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "png"),
-    out_dir_pdf  = file.path(out_dir, "plots", "relative_proteome_stacked_taxa", "pdf")
-  )
+  invisible(lapply(sex_levels,make_sex))
 }
 
-write_csv(
-  expr_ko,
-  file.path(
-    out_dir,
-    "tables",
-    "selected_KO_protein_level_values_used_for_statistics.csv"
-  )
-)
-message("Done.")
-
-ko_org_group_summary %>%
-  filter(
-    KO == "K01186",
-    Sex == "Females"
-  ) %>%
-  distinct(
-    Timepoint,
-    Group,
-    relative_ko_abundance,
-    median_relative_ko_abundance,
-    mean_ko_linear,
-    n_samples_total
-  ) %>%
-  arrange(Timepoint, Group)
-
-
+# 9. SAVE DIRECTLY INTO ONE FOLDER: 2 TIFF FILES PER EXCEL KO ------------
+requested_kos <- unique(as.character(ko_reference$KO))
+stopifnot(length(requested_kos)>0L)
+message('KO IDs requested in KO_map_file.xlsx: ',length(requested_kos))
+message('KO IDs with matched original dataset-specific protein results: ',
+        length(intersect(requested_kos,ko_plot_source$KO)))
+message('Writing TIFF plots to: ',out_dir)
+for (ko_now in requested_kos) {
+  plot_one_ko(ko_now)
+}
+message('COMPLETE: ',length(requested_kos)*2L,
+        ' TIFF figures (one per requested KO x sex).')
+message('Audit CSVs were saved in the Audit_Tables subfolder.')
