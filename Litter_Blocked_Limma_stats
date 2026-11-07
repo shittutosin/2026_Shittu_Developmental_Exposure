@@ -1,5 +1,6 @@
 
 #This code is run after the first limma code
+
 packages <- c('readxl', 'dplyr', 'tidyr', 'tibble', 'writexl', 'limma', 'statmod')
 missing_packages <- setdiff(packages, rownames(installed.packages()))
 if (length(missing_packages)) {
@@ -68,14 +69,14 @@ load_annotations <- function(path, protein_ids, dataset) {
       }
     }
     extras <- setdiff(names(tab), c('Protein', 'Control_1','Control_2',
-                  'Control_3','Control_4','Dosed_1','Dosed_2','Dosed_3','Dosed_4'))
+                                    'Control_3','Control_4','Dosed_1','Dosed_2','Dosed_3','Dosed_4'))
     if (!length(extras)) next
     overlap <- sum(protein_ids %in% tab$Protein)
     if (!overlap) next
- 
+    
     tab <- dplyr::select(tab, Protein, dplyr::all_of(extras))
     feature_score <- sum(grepl('function|organism|taxon|species|genus|kegg|ko|gene|annotation|description',
-                              extras, ignore.case=TRUE))
+                               extras, ignore.case=TRUE))
     candidates[[sheet]] <- list(data=tab, sheet=sheet, overlap=overlap,
                                 feature_score=feature_score, n_fields=length(extras))
   }
@@ -88,14 +89,14 @@ load_annotations <- function(path, protein_ids, dataset) {
                    vapply(candidates, `[[`, integer(1), 'n_fields'), decreasing=TRUE)
   chosen <- candidates[[ranking[1]]]
   anno <- chosen$data
-
+  
   n_matched <- sum(protein_ids %in% anno$Protein)
   if (n_matched < 0.5*length(protein_ids)) {
     stop(dataset, ': only ', n_matched, '/', length(protein_ids),
          ' protein IDs match source annotations in ', basename(path),
          ' (sheet ', chosen$sheet, '). Check Protein ID formatting/source.')
   }
- 
+  
   joined <- dplyr::left_join(tibble::tibble(Protein=protein_ids), anno,
                              by='Protein', relationship='one-to-one')
   if (!identical(joined$Protein, protein_ids)) stop(dataset, ': annotation order changed')
@@ -144,7 +145,7 @@ for (dataset in names(files)) {
   sex_code <- parts[[2]]
   sex <- if (sex_code == 'M') 'Male' else 'Female'
   input_path <- locate_input(files[[dataset]])
-
+  
   dat <- readxl::read_excel(input_path, .name_repair = 'minimal')
   if (!'Protein' %in% names(dat)) stop(dataset, ': missing Protein column')
   if (!setequal(setdiff(names(dat), 'Protein'), expected_columns) ||
@@ -163,7 +164,7 @@ for (dataset in names(files)) {
   rownames(mat) <- protein_ids
   if (any(!is.finite(mat))) stop(dataset, ': missing/NaN/Inf abundance detected')
   if (nrow(mat) < 10L) stop(dataset, ': unexpectedly few proteins')
-
+  
   map <- tibble::tibble(
     Dataset = dataset,
     Timepoint = timepoint,
@@ -197,18 +198,18 @@ for (dataset in names(files)) {
     stop(dataset, ': expected 4 mice and 2 independent litters per treatment')
   }
   if (!identical(map$OriginalColumn, colnames(mat))) stop('Sample order mismatch')
-
+  
   treatment <- factor(map$Treatment, levels = c('control', 'dosed'))
   design <- stats::model.matrix(~0 + treatment)
   colnames(design) <- c('control', 'dosed')
   contr <- limma::makeContrasts(dosed_vs_control = dosed - control, levels = design)
-
-
+  
+  
   fit_original <- limma::lmFit(mat, design)
   fit_original <- limma::contrasts.fit(fit_original, contr)
   fit_original <- limma::eBayes(fit_original, trend = TRUE, robust = TRUE)
-
-
+  
+  
   corfit <- limma::duplicateCorrelation(mat, design = design, block = map$LitterID)
   rho <- as.numeric(corfit$consensus.correlation)
   if (length(rho) != 1L || !is.finite(rho)) {
@@ -217,7 +218,7 @@ for (dataset in names(files)) {
   fit_blocked <- limma::lmFit(mat, design, block = map$LitterID, correlation = rho)
   fit_blocked <- limma::contrasts.fit(fit_blocked, contr)
   fit_blocked <- limma::eBayes(fit_blocked, trend = TRUE, robust = TRUE)
-
+  
   extract <- function(fit) {
     limma::topTable(fit, coef = 'dosed_vs_control', number = Inf,
                     adjust.method = 'BH', sort.by = 'none') |>
@@ -228,7 +229,7 @@ for (dataset in names(files)) {
   blocked <- extract(fit_blocked)
   original <- extract(fit_original)
   if (!identical(blocked$Protein, original$Protein)) stop(dataset, ': different protein order')
-
+  
   stats <- blocked |>
     dplyr::mutate(
       Dataset = dataset, Timepoint = timepoint, Sex = sex,
@@ -243,7 +244,7 @@ for (dataset in names(files)) {
       Consensus_Litter_Correlation = rho
     ) |>
     dplyr::relocate(Dataset, Timepoint, Sex, Protein)
-
+  
   ref <- original |>
     dplyr::select(Protein, Original_log2FC = log2FC,
                   Original_p = p_value, Original_BH_FDR = BH_FDR)
@@ -251,32 +252,32 @@ for (dataset in names(files)) {
     dplyr::select(Protein, log2FC, p_value, BH_FDR, Significance) |>
     dplyr::left_join(ref, by = 'Protein', relationship = 'one-to-one') |>
     dplyr::mutate(Delta_log2FC = log2FC - Original_log2FC)
-
+  
   
   intensity_table <- tibble::as_tibble(mat, rownames = 'Protein')
   colnames(intensity_table)[-1L] <- map$MouseID
-
+  
   
   annotation_path <- locate_input(annotation_files[[dataset]])
   ann <- load_annotations(annotation_path, protein_ids, dataset)
   function_table <- ann$table
   annotation_coverage <- ann$matched
   annotated_stats <- dplyr::left_join(stats, function_table,
-                                     by='Protein', relationship='one-to-one')
+                                      by='Protein', relationship='one-to-one')
   
   annotated_intensities <- dplyr::left_join(function_table, intensity_table,
-                                           by='Protein', relationship='one-to-one')
+                                            by='Protein', relationship='one-to-one')
   message(dataset, ': matched ', annotation_coverage, '/', nrow(mat),
           ' protein annotations from ', basename(annotation_path),
           ' sheet ', ann$sheet)
-
+  
   
   litter_mean_cols <- lapply(unique(map$LitterID), function(lit) {
     rowMeans(mat[, map$LitterID == lit, drop = FALSE])
   })
   names(litter_mean_cols) <- paste0('Litter_', unique(map$LitterID))
   litter_means <- tibble::as_tibble(c(list(Protein = protein_ids), litter_mean_cols))
-
+  
   settings <- tibble::tibble(
     Setting = c('Dataset', 'Input matrix', 'Scale', 'Treatment contrast',
                 'Litter blocking', 'Consensus litter correlation',
@@ -292,7 +293,7 @@ for (dataset in names(files)) {
                      basename(annotation_path), ' sheet ', ann$sheet),
               'Correlated model does not establish valid small-sample treatment-level p-values')
   )
-
+  
   out_file <- file.path(out_dir, paste0(dataset, '_Litter_Blocked_Protein_Results.xlsx'))
   writexl::write_xlsx(list(
     Protein_Statistics = stats,
@@ -307,7 +308,7 @@ for (dataset in names(files)) {
     Litter_Mean_Log2_QC = litter_means,
     Analysis_Settings = settings
   ), out_file)
-
+  
   summary_row <- tibble::tibble(
     Dataset = dataset, Timepoint = timepoint, Sex = sex,
     N_Mice = ncol(mat), N_Litters = dplyr::n_distinct(map$LitterID),
@@ -322,8 +323,8 @@ for (dataset in names(files)) {
   all_stats[[dataset]] <- stats
   all_annotated_stats[[dataset]] <- annotated_stats
   all_annotation_qc[[dataset]] <- tibble::tibble(Dataset=dataset, Source=basename(annotation_path),
-                   Sheet=ann$sheet, N_Proteins=nrow(mat), N_Matched=annotation_coverage,
-                   Percent_Matched=100*annotation_coverage/nrow(mat))
+                                                 Sheet=ann$sheet, N_Proteins=nrow(mat), N_Matched=annotation_coverage,
+                                                 Percent_Matched=100*annotation_coverage/nrow(mat))
   all_mappings[[dataset]] <- map
   message('Exported ', nrow(mat), ' proteins; consensus correlation ', signif(rho, 4),
           '; output ', basename(out_file))
