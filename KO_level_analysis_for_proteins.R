@@ -10,8 +10,8 @@ suppressPackageStartupMessages({
 })
 
 # 1. User settings ----------------------------------------------------------
-root <- paste0('/Users/oluwatosinshittu/Library/CloudStorage/',
-               'OneDrive-BaylorUniversity/proteomics_LIMAR_all timepoints')
+root <- paste0('root/',
+               'file_path')
 limma_dir <- file.path(root,'Litter_analysis','Final_Litter_Blocked_Limma')
 old_dir <- file.path(root,'Pathway_Enrichment_specific',
                      'high_confidence_hits','KO_summary','Pathway_intermediate_tables')
