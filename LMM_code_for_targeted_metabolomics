@@ -1,0 +1,612 @@
+
+
+pkgs <- c(
+  "readxl", "dplyr", "ggplot2",
+  "patchwork", "tibble"
+)
+
+missing <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing)) install.packages(missing)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# ------------------------------------------------------------
+# 1. FILE LOCATIONS
+# ------------------------------------------------------------
+
+base <- "/base_dir"
+
+onedrive_dir <- file.path(
+  base,
+  "Ofile_path"
+)
+
+box_dir <- file.path(
+  base,
+  "file_path"
+)
+
+dirs <- c(onedrive_dir, box_dir)
+
+valid <- vapply(dirs, function(x) {
+  file.exists(file.path(x, "SBA_Quality_Control.xlsx")) &&
+    file.exists(file.path(x, "SBA_Litter_Adjusted_Stats.xlsx"))
+}, logical(1))
+
+if (!any(valid)) {
+  stop("Saved SBA QC and statistics workbooks not found.")
+}
+
+input_dir <- dirs[which(valid)[1]]
+output_dir <- onedrive_dir
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------
+# 2. LOAD SAVED DATA
+# ------------------------------------------------------------
+
+sba <- readxl::read_excel(
+  file.path(input_dir, "SBA_Quality_Control.xlsx"),
+  sheet = "All_Mouse_Analyte_Values"
+)
+
+stats <- readxl::read_excel(
+  file.path(input_dir, "SBA_Litter_Adjusted_Stats.xlsx"),
+  sheet = "LMM_Contrasts"
+)
+
+needed_data <- c(
+  "Analyte", "Timepoint", "Sex",
+  "Treatment", "Concentration"
+)
+
+needed_stats <- c(
+  "Analyte", "Timepoint", "Sex",
+  "Significance"
+)
+
+stopifnot(
+  all(needed_data %in% names(sba)),
+  all(needed_stats %in% names(stats)),
+  is.numeric(sba$Concentration),
+  all(is.finite(sba$Concentration))
+)
+
+compounds <- c(
+  "Deoxycholic acid",
+  "Ursodeoxycholic acid",
+  "Lithocholic acid"
+)
+
+labels_x <- c(
+  "Deoxycholic",
+  "Ursodeoxycholic",
+  "Lithocholic acid"
+)
+
+ages <- c("5W", "8W", "12W")
+colors <- c(Control = "#A6C8F0", Dosed = "#BD191C")
+
+# ------------------------------------------------------------
+# 3. BOXPLOT STATISTICS — ORIGINAL CONCENTRATIONS
+# ------------------------------------------------------------
+
+box_stats <- function(d) {
+  
+  d %>%
+    group_by(Analyte, Treatment) %>%
+    group_modify(~ {
+      
+      v <- .x$Concentration
+      
+      q <- as.numeric(
+        quantile(v, c(.25, .5, .75), type = 7)
+      )
+      
+      iq <- q[3] - q[1]
+      
+      tibble(
+        lo = q[1],
+        med = q[2],
+        hi = q[3],
+        wlo = min(v[v >= q[1] - 1.5 * iq]),
+        whi = max(v[v <= q[3] + 1.5 * iq])
+      )
+      
+    }) %>%
+    ungroup() %>%
+    mutate(
+      x = match(as.character(Analyte), compounds) +
+        if_else(
+          as.character(Treatment) == "Control",
+          -.15, .15
+        ),
+      xmin = x - .12,
+      xmax = x + .12
+    )
+}
+
+# ------------------------------------------------------------
+# 4. ENLARGED LOWER Y-AXIS AND BREAK
+# ------------------------------------------------------------
+
+make_axis <- function(d, ann) {
+  
+  upper <- max(
+    c(d$Concentration, ann$star_raw),
+    na.rm = TRUE
+  )
+  
+  upper <- max(upper * 1.12, 0.05)
+  
+  lca <- d$Concentration[
+    as.character(d$Analyte) == "Lithocholic acid"
+  ]
+  
+  other <- d$Concentration[
+    as.character(d$Analyte) != "Lithocholic acid"
+  ]
+  
+  low_max <- max(lca)
+  high_min <- min(other)
+  
+  # Space above LCA for significance brackets
+  cut1 <- max(
+    low_max * 1.30,
+    low_max + 0.10,
+    0.05
+  )
+  
+  cut2 <- high_min * 0.90
+  
+  # Only break a genuinely empty interval
+  broken <- is.finite(cut1) &&
+    is.finite(cut2) &&
+    cut2 > cut1 + 0.25 &&
+    high_min > low_max * 1.25 &&
+    upper > cut2
+  
+  if (broken) {
+    
+    # Lower region = 42% of plotting height
+    # Break region = 10%
+    # Upper region = 43%
+    
+    fn <- function(z) {
+      
+      ifelse(
+        z <= cut1,
+        42 * z / cut1,
+        ifelse(
+          z >= cut2,
+          52 + 43 * (z - cut2) / (upper - cut2),
+          42 + 10 * (z - cut1) / (cut2 - cut1)
+        )
+      )
+    }
+    
+    ticks <- sort(unique(c(
+      0,
+      pretty(c(0, cut1), n = 4),
+      pretty(c(cut2, upper), n = 4)
+    )))
+    
+    ticks <- ticks[
+      ticks >= 0 &
+        ticks <= upper &
+        (ticks <= cut1 | ticks >= cut2)
+    ]
+    
+  } else {
+    
+    fn <- function(z) 95 * z / upper
+    
+    ticks <- pretty(c(0, upper), n = 5)
+    ticks <- ticks[
+      ticks >= 0 & ticks <= upper
+    ]
+  }
+  
+  list(
+    fn = fn,
+    broken = broken,
+    ticks = fn(ticks),
+    ticklabels = format(
+      ticks,
+      trim = TRUE,
+      scientific = FALSE,
+      digits = 4
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 5. CREATE INDIVIDUAL AGE PANEL
+# ------------------------------------------------------------
+
+make_panel <- function(sex, age) {
+  
+  d <- sba %>%
+    filter(
+      as.character(Sex) == sex,
+      as.character(Timepoint) == age
+    ) %>%
+    mutate(
+      Analyte = factor(
+        as.character(Analyte),
+        levels = compounds
+      ),
+      Treatment = factor(
+        as.character(Treatment),
+        levels = c("Control", "Dosed")
+      )
+    )
+  
+  if (
+    nrow(d) != 24 ||
+    anyNA(d$Analyte) ||
+    anyNA(d$Treatment) ||
+    any(table(d$Analyte, d$Treatment) != 4)
+  ) {
+    stop("Unexpected data groups for ", sex, " ", age)
+  }
+  
+  b <- box_stats(d)
+  
+  st <- stats %>%
+    filter(
+      as.character(Sex) == sex,
+      as.character(Timepoint) == age
+    ) %>%
+    select(Analyte, Significance)
+  
+  if (anyDuplicated(as.character(st$Analyte))) {
+    stop("Duplicate significance rows for ", sex, " ", age)
+  }
+  
+  # ----------------------------------------------------------
+  # Significance annotations
+  # ----------------------------------------------------------
+  
+  ann <- d %>%
+    group_by(Analyte) %>%
+    summarise(
+      ymin = min(Concentration),
+      ymax = max(Concentration),
+      .groups = "drop"
+    ) %>%
+    mutate(Analyte = as.character(Analyte)) %>%
+    left_join(st, by = "Analyte") %>%
+    filter(
+      !is.na(Significance),
+      Significance %in% c("*", "**", "***")
+    ) %>%
+    mutate(
+      span = pmax(
+        ymax - ymin,
+        ymax * .12,
+        .02
+      ),
+      bracket_raw = ymax + .12 * span,
+      star_raw = bracket_raw + .07 * span,
+      center = match(Analyte, compounds)
+    )
+  
+  # ----------------------------------------------------------
+  # Apply display-only axis transformation
+  # ----------------------------------------------------------
+  
+  ax <- make_axis(d, ann)
+  f <- ax$fn
+  
+  message(
+    sex, " ", age, ": ",
+    if (ax$broken) {
+      "broken axis applied"
+    } else {
+      "linear axis retained (no safe gap)"
+    }
+  )
+  
+  b <- b %>%
+    mutate(
+      ylo = f(lo),
+      ymed = f(med),
+      yhi = f(hi),
+      ywlo = f(wlo),
+      ywhi = f(whi)
+    )
+  
+  ann <- ann %>%
+    mutate(
+      ybr = f(bracket_raw),
+      ystar = f(star_raw),
+      ytick = ybr - 1.4
+    )
+  
+  # Keep LCA significance below the broken section
+  if (ax$broken && nrow(ann) > 0) {
+    
+    lca_row <- ann$Analyte == "Lithocholic acid"
+    
+    ann$ybr[lca_row] <- pmin(
+      38,
+      f(ann$ymax[lca_row]) + 3
+    )
+    
+    ann$ystar[lca_row] <-
+      ann$ybr[lca_row] + 2.3
+    
+    ann$ytick[lca_row] <-
+      ann$ybr[lca_row] - 1.4
+  }
+  
+  # ----------------------------------------------------------
+  # Build original-style boxplot
+  # ----------------------------------------------------------
+  
+  p <- ggplot() +
+    
+    # Whiskers
+    geom_segment(
+      data = b,
+      aes(
+        x = x, xend = x,
+        y = ywlo, yend = ywhi
+      ),
+      linewidth = .45
+    ) +
+    
+    # Colored boxes
+    geom_rect(
+      data = b,
+      aes(
+        xmin = xmin,
+        xmax = xmax,
+        ymin = ylo,
+        ymax = yhi,
+        fill = Treatment
+      ),
+      color = "black",
+      linewidth = .45
+    ) +
+    
+    # Median lines
+    geom_segment(
+      data = b,
+      aes(
+        x = xmin, xend = xmax,
+        y = ymed, yend = ymed
+      ),
+      linewidth = .6
+    ) +
+    
+    # Bottom whisker caps
+    geom_segment(
+      data = b,
+      aes(
+        x = x - .05, xend = x + .05,
+        y = ywlo, yend = ywlo
+      ),
+      linewidth = .4
+    ) +
+    
+    # Top whisker caps
+    geom_segment(
+      data = b,
+      aes(
+        x = x - .05, xend = x + .05,
+        y = ywhi, yend = ywhi
+      ),
+      linewidth = .4
+    ) +
+    
+    scale_fill_manual(
+      values = colors,
+      breaks = c("Control", "Dosed"),
+      name = NULL
+    ) +
+    
+    scale_x_continuous(
+      limits = c(.5, 3.5),
+      breaks = 1:3,
+      labels = labels_x,
+      expand = expansion(mult = 0)
+    ) +
+    
+    scale_y_continuous(
+      limits = c(0, 103),
+      breaks = ax$ticks,
+      labels = ax$ticklabels,
+      expand = expansion(mult = 0)
+    ) +
+    
+    coord_cartesian(clip = "off") +
+    
+    # Horizontal line beneath age heading
+    annotate(
+      "segment",
+      x = .75, xend = 3.25,
+      y = 100, yend = 100,
+      linewidth = .55
+    ) +
+    
+    labs(
+      title = age,
+      x = NULL,
+      y = "Conc (ng/ml)"
+    ) +
+    
+    theme_classic(base_size = 10) +
+    
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 13,
+        hjust = .5
+      ),
+      
+      axis.title.y = element_text(
+        face = "bold",
+        size = 10
+      ),
+      
+      axis.text.y = element_text(
+        size = 9,
+        color = "black"
+      ),
+      
+      axis.text.x = element_text(
+        size = 9,
+        face = "bold",
+        color = "black",
+        angle = 50,
+        hjust = 1,
+        vjust = 1
+      ),
+      
+      plot.margin = margin(5, 5, 5, 5),
+      
+      legend.position = "bottom",
+      
+      legend.text = element_text(
+        face = "bold",
+        size = 10
+      )
+    )
+  
+  # ----------------------------------------------------------
+  # Significance brackets
+  # ----------------------------------------------------------
+  
+  if (nrow(ann) > 0) {
+    
+    p <- p +
+      
+      geom_segment(
+        data = ann,
+        aes(
+          x = center - .27,
+          xend = center + .27,
+          y = ybr,
+          yend = ybr
+        ),
+        linewidth = .45
+      ) +
+      
+      geom_segment(
+        data = ann,
+        aes(
+          x = center - .27,
+          xend = center - .27,
+          y = ytick,
+          yend = ybr
+        ),
+        linewidth = .45
+      ) +
+      
+      geom_segment(
+        data = ann,
+        aes(
+          x = center + .27,
+          xend = center + .27,
+          y = ytick,
+          yend = ybr
+        ),
+        linewidth = .45
+      ) +
+      
+      geom_text(
+        data = ann,
+        aes(
+          x = center,
+          y = ystar,
+          label = Significance
+        ),
+        fontface = "bold",
+        size = 3.2,
+        vjust = 0
+      )
+  }
+  
+  # ----------------------------------------------------------
+  # Clearly indicate y-axis discontinuity
+  # ----------------------------------------------------------
+  
+  if (ax$broken) {
+    
+    p <- p +
+      
+      annotate(
+        "segment",
+        x = .48, xend = .55,
+        y = 43, yend = 46,
+        linewidth = .75
+      ) +
+      
+      annotate(
+        "segment",
+        x = .48, xend = .55,
+        y = 48, yend = 51,
+        linewidth = .75
+      )
+  }
+  
+  return(p)
+}
+
+# ------------------------------------------------------------
+# 6. COMPILE MALE AND FEMALE FIGURES
+# ------------------------------------------------------------
+
+for (sx in c("Male", "Female")) {
+  
+  panels <- lapply(
+    ages,
+    function(tp) make_panel(sx, tp)
+  )
+  
+  combined <- patchwork::wrap_plots(
+    panels,
+    nrow = 1,
+    widths = c(1, 1, 1),
+    guides = "collect"
+  ) &
+    theme(legend.position = "bottom")
+  
+  filename <- paste0(
+    "SBA_",
+    ifelse(sx == "Male", "Males", "Females"),
+    "_5W_8W_12W_BrokenAxis"
+  )
+  
+  ggsave(
+    filename = file.path(
+      output_dir,
+      paste0(filename, ".tiff")
+    ),
+    plot = combined,
+    width = 12.6,
+    height = 4.7,
+    units = "in",
+    dpi = 400,
+    compression = "lzw",
+    bg = "white"
+  )
+  
+  ggsave(
+    filename = file.path(
+      output_dir,
+      paste0(filename, ".pdf")
+    ),
+    plot = combined,
+    width = 12.6,
+    height = 4.7,
+    units = "in",
+    bg = "white"
+  )
+  
+  message("Saved: ", filename)
+}
+
+message("All figures saved to: ", output_dir)
